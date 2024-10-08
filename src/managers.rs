@@ -65,19 +65,19 @@ pub trait NetworkProvider: 'static + Send + Sync {
 
     /// The type that acts as a combined sender and reciever for the network.
     /// This type needs to be able to be split.
-    type Socket: Send + Sync + Clone;
+    type Socket: Send;
 
     /// The read half of the given socket type.
-    type ReadHalf: Send + Sync + Clone;
+    type ReadHalf: Send;
 
     /// The write half of the given socket type.
-    type WriteHalf: Send + Sync + Clone;
+    type WriteHalf: Send;
 
     /// Info necessary to start a connection, an [`std::net::SocketAddr`] for instance
-    type ConnectInfo: Send + Sync;
+    type ConnectInfo: Send;
 
     /// Info necessary to start a connection, an [`std::net::SocketAddr`] for instance
-    type AcceptInfo: Send + Sync;
+    type AcceptInfo: Send;
 
     /// The output type of [`Self::accept_loop`]
     type AcceptStream: Stream<Item = Self::Socket> + Unpin + Send;
