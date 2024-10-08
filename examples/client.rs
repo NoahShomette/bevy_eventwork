@@ -2,10 +2,14 @@
 
 use async_net::{Ipv4Addr, SocketAddr};
 use bevy::{
+    color::palettes,
     prelude::*,
     tasks::{TaskPool, TaskPoolBuilder},
 };
-use bevy_eventwork::{ConnectionId, EventworkRuntime, Network, NetworkData, NetworkEvent};
+use bevy_eventwork::{
+    managers::network::{MessageError, Network},
+    ConnectionId, EventworkRuntime, NetworkData, NetworkEvent,
+};
 use std::net::IpAddr;
 
 use bevy_eventwork::tcp::{NetworkSettings, TcpProvider};
@@ -31,7 +35,7 @@ fn main() {
 
     // A good way to ensure that you are not forgetting to register
     // any messages is to register them where they are defined!
-    shared::client_register_network_messages(&mut app);
+    shared::register_network_messages(&mut app);
 
     app.add_systems(Startup, setup_ui);
 
@@ -42,6 +46,7 @@ fn main() {
             handle_message_button,
             handle_incoming_messages,
             handle_network_events,
+            handle_error_messages,
         ),
     );
 
@@ -54,9 +59,6 @@ fn main() {
 
     app.run();
 }
-
-#[derive(Resource)]
-struct NetworkTaskPool(TaskPool);
 
 ///////////////////////////////////////////////////////////////
 ////////////// Incoming Message Handler ///////////////////////
@@ -124,7 +126,7 @@ impl FromWorld for GlobalChatSettings {
             },
             author_style: TextStyle {
                 font_size: 20.,
-                color: Color::RED,
+                color: palettes::css::RED.into(),
                 ..default()
             },
         }
@@ -213,7 +215,7 @@ type GameChatMessages = ChatMessages<ChatMessage>;
 struct ConnectButton;
 
 fn handle_connect_button(
-    net: ResMut<Network<TcpProvider>>,
+    net: Network<TcpProvider>,
     settings: Res<NetworkSettings>,
     interaction_query: Query<
         (&Interaction, &Children),
@@ -253,31 +255,35 @@ fn handle_connect_button(
 struct MessageButton;
 
 fn handle_message_button(
-    net: Res<Network<TcpProvider>>,
+    mut net: Network<TcpProvider>,
     interaction_query: Query<&Interaction, (Changed<Interaction>, With<MessageButton>)>,
+) {
+    for interaction in interaction_query.iter() {
+        if let Interaction::Pressed = interaction {
+            net.send_message(
+                ConnectionId { id: 0 },
+                shared::UserChatMessage {
+                    message: String::from("Hello there!"),
+                },
+            );
+        }
+    }
+}
+
+fn handle_error_messages(
     mut messages: Query<&mut GameChatMessages>,
+    mut errors: EventReader<MessageError>,
 ) {
     let mut messages = if let Ok(messages) = messages.get_single_mut() {
         messages
     } else {
         return;
     };
-
-    for interaction in interaction_query.iter() {
-        if let Interaction::Pressed = interaction {
-            match net.send_message(
-                ConnectionId { id: 0 },
-                shared::UserChatMessage {
-                    message: String::from("Hello there!"),
-                },
-            ) {
-                Ok(()) => (),
-                Err(err) => messages.add(SystemMessage::new(format!(
-                    "Could not send message: {}",
-                    err
-                ))),
-            }
-        }
+    for error in errors.read() {
+        messages.add(SystemMessage::new(format!(
+            "Could not send message: {}",
+            error.error()
+        )));
     }
 }
 
@@ -358,7 +364,7 @@ fn setup_ui(mut commands: Commands, _materials: ResMut<Assets<ColorMaterial>>) {
                         height: Val::Percent(10.0),
                         ..Default::default()
                     },
-                    background_color: Color::GRAY.into(),
+                    background_color: palettes::css::GRAY.into(),
                     ..Default::default()
                 })
                 .with_children(|parent_button_bar| {

@@ -35,19 +35,10 @@ impl NetworkMessage for NewChatMessage {
 }
 
 #[allow(unused)]
-pub fn client_register_network_messages(app: &mut App) {
+pub fn register_network_messages(app: &mut App) {
     use bevy_eventwork::AppNetworkMessage;
 
-    // The client registers messages that arrives from the server, so that
-    // it is prepared to handle them. Otherwise, an error occurs.
-    app.listen_for_message::<NewChatMessage, TcpProvider>();
-}
-
-#[allow(unused)]
-pub fn server_register_network_messages(app: &mut App) {
-    use bevy_eventwork::AppNetworkMessage;
-
-    // The server registers messages that arrives from a client, so that
-    // it is prepared to handle them. Otherwise, an error occurs.
-    app.listen_for_message::<UserChatMessage, TcpProvider>();
+    // Both the client and the server need to register all messages that they want to receive or send
+    app.register_message::<NewChatMessage, TcpProvider>();
+    app.register_message::<UserChatMessage, TcpProvider>();
 }

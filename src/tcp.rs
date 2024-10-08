@@ -5,7 +5,7 @@ use crate::{
     async_trait,
     error::NetworkError,
     managers::NetworkProvider,
-    NetworkPacket,
+    NetworkPacket, NetworkSerializedData,
 };
 use async_net::{TcpListener, TcpStream};
 use bevy::{
@@ -15,7 +15,7 @@ use bevy::{
 use futures_lite::{AsyncReadExt, AsyncWriteExt, FutureExt, Stream};
 use std::future::Future;
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 /// Provides a tcp stream and listener for eventwork.
 pub struct TcpProvider;
 
@@ -70,6 +70,7 @@ impl NetworkProvider for TcpProvider {
         mut read_half: Self::ReadHalf,
         messages: Sender<NetworkPacket>,
         settings: Self::NetworkSettings,
+        network_packet_de: fn(data: NetworkSerializedData) -> Result<NetworkPacket, String>,
     ) {
         let mut buffer = vec![0; settings.max_packet_length];
         loop {
@@ -125,13 +126,14 @@ impl NetworkProvider for TcpProvider {
             }
             info!("Message read");
 
-            let packet: NetworkPacket = match bincode::deserialize(&buffer[..length]) {
-                Ok(packet) => packet,
-                Err(err) => {
-                    error!("Failed to decode network packet from: {}", err);
-                    break;
-                }
-            };
+            let packet: NetworkPacket =
+                match network_packet_de(NetworkSerializedData::Binary(buffer[..length].to_vec())) {
+                    Ok(packet) => packet,
+                    Err(err) => {
+                        error!("Failed to decode network packet from: {}", err);
+                        break;
+                    }
+                };
 
             if messages.send(packet).await.is_err() {
                 error!("Failed to send decoded message to eventwork");
@@ -145,14 +147,21 @@ impl NetworkProvider for TcpProvider {
         mut write_half: Self::WriteHalf,
         messages: Receiver<NetworkPacket>,
         _settings: Self::NetworkSettings,
+        network_packet_ser: fn(data: NetworkPacket) -> Result<NetworkSerializedData, String>,
     ) {
         while let Ok(message) = messages.recv().await {
-            let encoded = match bincode::serialize(&message) {
+            let message_kind = message.kind.clone();
+            let encoded = match network_packet_ser(message) {
                 Ok(encoded) => encoded,
                 Err(err) => {
-                    error!("Could not encode packet {:?}: {}", message, err);
+                    error!("Could not encode packet {:?}: {}", message_kind, err);
                     continue;
                 }
+            };
+
+            let encoded = match encoded {
+                NetworkSerializedData::String(_) => continue,
+                NetworkSerializedData::Binary(vec) => vec,
             };
 
             let len = encoded.len() as u64;
@@ -171,7 +180,7 @@ impl NetworkProvider for TcpProvider {
             match write_half.write_all(&encoded).await {
                 Ok(_) => (),
                 Err(err) => {
-                    error!("Could not send packet: {:?}: {}", message, err);
+                    error!("Could not send packet: {:?}: {}", message_kind, err);
                     break;
                 }
             }

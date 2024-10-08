@@ -1,10 +1,18 @@
-use std::sync::{
-    atomic::{AtomicU32, Ordering},
-    Arc,
+use std::{
+    ops::Deref,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
 };
 
 use async_channel::unbounded;
-use bevy::prelude::*;
+use bevy::{
+    app::{App, PreUpdate},
+    ecs::system::SystemParam,
+    log::{debug, error, trace, warn},
+    prelude::{Commands, Event, EventWriter, Query, Res, ResMut, Trigger},
+};
 use dashmap::DashMap;
 use futures_lite::StreamExt;
 
@@ -12,12 +20,14 @@ use crate::{
     error::NetworkError,
     network_message::NetworkMessage,
     runtime::{run_async, EventworkRuntime},
-    AsyncChannel, Connection, ConnectionId, NetworkData, NetworkEvent, NetworkPacket, Runtime,
+    serialize::{bincode_de, bincode_ser, ComponentSerdeFns},
+    AsyncChannel, Connection, ConnectionId, NetworkData, NetworkEvent, NetworkPacket,
+    NetworkSerializedData, Runtime,
 };
 
-use super::{Network, NetworkProvider};
+use super::{NetworkInstance, NetworkPacketSerdeFn, NetworkProvider};
 
-impl<NP: NetworkProvider> std::fmt::Debug for Network<NP> {
+impl<NP: NetworkProvider> std::fmt::Debug for NetworkInstance<NP> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -27,7 +37,7 @@ impl<NP: NetworkProvider> std::fmt::Debug for Network<NP> {
     }
 }
 
-impl<NP: NetworkProvider> Network<NP> {
+impl<NP: NetworkProvider> NetworkInstance<NP> {
     pub(crate) fn new(_provider: NP) -> Self {
         Self {
             recv_message_map: Arc::new(DashMap::new()),
@@ -41,7 +51,6 @@ impl<NP: NetworkProvider> Network<NP> {
             connection_count: 0,
         }
     }
-
     /// Returns true if there are any active connections
     #[inline(always)]
     pub fn has_connections(&self) -> bool {
@@ -132,51 +141,6 @@ impl<NP: NetworkProvider> Network<NP> {
         );
     }
 
-    /// Send a message to a specific client
-    pub fn send_message<T: NetworkMessage>(
-        &self,
-        client_id: ConnectionId,
-        message: T,
-    ) -> Result<(), NetworkError> {
-        let connection = match self.established_connections.get(&client_id) {
-            Some(conn) => conn,
-            None => return Err(NetworkError::ConnectionNotFound(client_id)),
-        };
-
-        let packet = NetworkPacket {
-            kind: String::from(T::NAME),
-            data: bincode::serialize(&message).map_err(|_| NetworkError::Serialization)?,
-        };
-
-        match connection.send_message.try_send(packet) {
-            Ok(_) => (),
-            Err(err) => {
-                error!("There was an error sending a packet: {}", err);
-                return Err(NetworkError::ChannelClosed(client_id));
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Broadcast a message to all connected clients
-    pub fn broadcast<T: NetworkMessage + Clone>(&self, message: T) {
-        let serialized_message = bincode::serialize(&message).expect("Couldn't serialize message!");
-        for connection in self.established_connections.iter() {
-            let packet = NetworkPacket {
-                kind: String::from(T::NAME),
-                data: serialized_message.clone(),
-            };
-
-            match connection.send_message.try_send(packet) {
-                Ok(_) => (),
-                Err(err) => {
-                    warn!("Could not send to client because: {}", err);
-                }
-            }
-        }
-    }
-
     /// Disconnect all clients and stop listening for new ones
     ///
     /// ## Notes
@@ -196,10 +160,39 @@ impl<NP: NetworkProvider> Network<NP> {
             while self.new_connections.receiver.try_recv().is_ok() {}
         }
     }
+}
+
+/// A system param used to interact with the network.
+#[derive(SystemParam)]
+pub struct Network<'w, 's, NP: NetworkProvider> {
+    network: ResMut<'w, NetworkInstance<NP>>,
+    commands: Commands<'w, 's>,
+}
+
+impl<'w, 's, NP: NetworkProvider> Network<'w, 's, NP> {
+    /// Send a message to a specific client
+    pub fn send_message<T: NetworkMessage>(&mut self, client_id: ConnectionId, message: T) {
+        self.commands.trigger(SendMessage {
+            clients: vec![client_id],
+            message,
+        });
+    }
+
+    /// Broadcast a message to all connected clients
+    pub fn broadcast<T: NetworkMessage + Clone>(&mut self, message: T) {
+        let clients = self
+            .network
+            .established_connections
+            .deref()
+            .into_iter()
+            .map(|connection| connection.key().clone())
+            .collect();
+        self.commands.trigger(SendMessage { clients, message });
+    }
 
     /// Disconnect a specific client
     pub fn disconnect(&self, conn_id: ConnectionId) -> Result<(), NetworkError> {
-        let connection = if let Some(conn) = self.established_connections.remove(&conn_id) {
+        let connection = if let Some(conn) = self.network.established_connections.remove(&conn_id) {
             conn
         } else {
             return Err(NetworkError::ConnectionNotFound(conn_id));
@@ -209,10 +202,49 @@ impl<NP: NetworkProvider> Network<NP> {
 
         Ok(())
     }
+
+    /// Returns true if there are any active connections
+    #[inline(always)]
+    pub fn has_connections(&self) -> bool {
+        self.network.has_connections()
+    }
+
+    /// Start listening for new clients
+    ///
+    /// ## Note
+    /// If you are already listening for new connections, this will cancel the original listen
+    pub fn listen<RT: Runtime>(
+        &mut self,
+        accept_info: NP::AcceptInfo,
+        runtime: &RT,
+        network_settings: &NP::NetworkSettings,
+    ) -> Result<(), NetworkError> {
+        self.network.listen(accept_info, runtime, network_settings)
+    }
+
+    /// Start async connecting to a remote server.
+    pub fn connect<RT: Runtime>(
+        &self,
+        connect_info: NP::ConnectInfo,
+        runtime: &RT,
+        network_settings: &NP::NetworkSettings,
+    ) {
+        self.network
+            .connect(connect_info, runtime, network_settings);
+    }
+
+    /// Disconnect all clients and stop listening for new ones
+    ///
+    /// ## Notes
+    /// This operation is idempotent and will do nothing if you are not actively listening
+    pub fn stop(&mut self) {
+        self.network.stop();
+    }
 }
 
 pub(crate) fn handle_new_incoming_connections<NP: NetworkProvider, RT: Runtime>(
-    mut server: ResMut<Network<NP>>,
+    mut server: ResMut<NetworkInstance<NP>>,
+    network_serde: Res<NetworkPacketSerdeFn>,
     runtime: Res<EventworkRuntime<RT>>,
     network_settings: Res<NP::NetworkSettings>,
     mut network_events: EventWriter<NetworkEvent>,
@@ -231,12 +263,14 @@ pub(crate) fn handle_new_incoming_connections<NP: NetworkProvider, RT: Runtime>(
         let (outgoing_tx, outgoing_rx) = unbounded();
         let (incoming_tx, incoming_rx) = unbounded();
 
+        let de = network_serde.network_packet_de.clone();
+        let ser = network_serde.network_packet_ser.clone();
         server.established_connections.insert(
                 conn_id,
                 Connection {
                     receive_task: Box::new(run_async(async move {
                         trace!("Starting listen task for {}", id);
-                        NP::recv_loop(read_half, incoming_tx, read_network_settings).await;
+                        NP::recv_loop(read_half, incoming_tx, read_network_settings, de).await;
 
                         match disconnected_connections.send(conn_id).await {
                             Ok(_) => (),
@@ -257,7 +291,7 @@ pub(crate) fn handle_new_incoming_connections<NP: NetworkProvider, RT: Runtime>(
                     }, &runtime.0)),
                     send_task: Box::new(run_async(async move {
                         trace!("Starting send task for {}", id);
-                        NP::send_loop(write_half, outgoing_rx, write_network_settings).await;
+                        NP::send_loop(write_half, outgoing_rx, write_network_settings, ser).await;
                     }, &runtime.0)),
                     send_message: outgoing_tx,
                     //addr: new_conn.addr,
@@ -284,29 +318,75 @@ pub trait AppNetworkMessage {
     /// - Add a new event type of [`NetworkData<T>`]
     /// - Register the type for transformation over the wire
     /// - Internal bookkeeping
-    fn listen_for_message<T: NetworkMessage, NP: NetworkProvider>(&mut self) -> &mut Self;
+    fn register_message<T: NetworkMessage, NP: NetworkProvider>(&mut self) -> &mut Self;
+
+    /// Register a network message type with a custom serialization format
+    ///
+    /// ## Note
+    ///
+    /// Don't forget to register your new [`NetworkSerialization`] format on the server using [`crate::serialize::register_serialization`] otherwise servers will silently fail.
+    ///
+    /// ## Details
+    /// This will do everything that [`AppNetworkMessage::listen_for_message`] will do but with the given custom ser/de functions and serialization format:
+    fn register_message_with<T: NetworkMessage, NP: NetworkProvider>(
+        &mut self,
+        de_fn: fn(data: &NetworkSerializedData) -> Result<T, String>,
+        ser_fn: fn(data: &T) -> Result<NetworkSerializedData, String>,
+    ) -> &mut Self;
 }
 
 impl AppNetworkMessage for App {
-    fn listen_for_message<T: NetworkMessage, NP: NetworkProvider>(&mut self) -> &mut Self {
-        let server = self.world.get_resource::<Network<NP>>().expect("Could not find `Network`. Be sure to include the `ServerPlugin` before listening for server messages.");
+    fn register_message<T: NetworkMessage, NP: NetworkProvider>(&mut self) -> &mut Self {
+        let server = self.world().get_resource::<NetworkInstance<NP>>().expect("Could not find `Network`. Be sure to include the `ServerPlugin` before listening for server messages.");
 
         debug!("Registered a new ServerMessage: {}", T::NAME);
-
         assert!(
             !server.recv_message_map.contains_key(T::NAME),
             "Duplicate registration of ServerMessage: {}",
             T::NAME
         );
         server.recv_message_map.insert(T::NAME, Vec::new());
+        self.world_mut().spawn(ComponentSerdeFns::<T> {
+            de_fn: bincode_de::<T>,
+            ser_fn: bincode_ser::<T>,
+        });
+        self.observe(send_message::<T, NP>);
+
         self.add_event::<NetworkData<T>>();
+        self.add_event::<SendMessage<T>>();
+        self.add_systems(PreUpdate, register_message::<T, NP>)
+    }
+
+    fn register_message_with<T: NetworkMessage, NP: NetworkProvider>(
+        &mut self,
+        de_fn: fn(data: &NetworkSerializedData) -> Result<T, String>,
+        ser_fn: fn(data: &T) -> Result<NetworkSerializedData, String>,
+    ) -> &mut Self {
+        let server = self.world().get_resource::<NetworkInstance<NP>>().expect("Could not find `Network`. Be sure to include the `ServerPlugin` before listening for server messages.");
+
+        debug!("Registered a new ServerMessage: {}", T::NAME);
+        assert!(
+            !server.recv_message_map.contains_key(T::NAME),
+            "Duplicate registration of ServerMessage: {}",
+            T::NAME
+        );
+        server.recv_message_map.insert(T::NAME, Vec::new());
+
+        self.world_mut()
+            .spawn(ComponentSerdeFns::<T> { de_fn, ser_fn });
+
+        self.observe(send_message::<T, NP>);
+
+        self.add_event::<NetworkData<T>>();
+        self.add_event::<SendMessage<T>>();
         self.add_systems(PreUpdate, register_message::<T, NP>)
     }
 }
 
 pub(crate) fn register_message<T, NP: NetworkProvider>(
-    net_res: ResMut<Network<NP>>,
+    net_res: ResMut<NetworkInstance<NP>>,
     mut events: EventWriter<NetworkData<T>>,
+    serde_query: Query<&ComponentSerdeFns<T>>,
 ) where
     T: NetworkMessage,
 {
@@ -314,10 +394,100 @@ pub(crate) fn register_message<T, NP: NetworkProvider>(
         Some(messages) => messages,
         None => return,
     };
+    if let Ok(serde) = serde_query.get_single() {
+        events.send_batch(messages.drain(..).filter_map(|(source, msg)| {
+            (serde.de_fn)(&msg)
+                .ok()
+                .map(|inner| NetworkData { source, inner })
+        }));
+    };
+}
 
-    events.send_batch(messages.drain(..).filter_map(|(source, msg)| {
-        bincode::deserialize::<T>(&msg)
-            .ok()
-            .map(|inner| NetworkData { source, inner })
-    }));
+/// An event that will send a message over the network to the given clients with the given message
+#[derive(Event)]
+pub struct SendMessage<T: NetworkMessage> {
+    clients: Vec<ConnectionId>,
+    message: T,
+}
+
+impl<T: NetworkMessage> SendMessage<T> {
+    /// Create a new instance of [`SendMessage`]
+    pub fn new(clients: Vec<ConnectionId>, message: T) -> SendMessage<T> {
+        Self { clients, message }
+    }
+}
+
+pub(crate) fn send_message<T, NP: NetworkProvider>(
+    send_event: Trigger<SendMessage<T>>,
+    net_res: ResMut<NetworkInstance<NP>>,
+    mut error_events: EventWriter<MessageError>,
+    serde_query: Query<&ComponentSerdeFns<T>>,
+) where
+    T: NetworkMessage,
+{
+    for target_id in send_event.event().clients.iter() {
+        let connection = match net_res.established_connections.get(&target_id) {
+            Some(conn) => conn,
+            None => {
+                error_events.send(MessageError {
+                    kind: T::NAME.to_string(),
+                    error: format!("client not found: {}", target_id),
+                });
+                return;
+            }
+        };
+
+        let Ok(serde) = serde_query.get_single() else {
+            panic!("No serde functions found for the requested type");
+        };
+
+        let Ok(serialized_message) = (serde.ser_fn)(&send_event.event().message) else {
+            error_events.send(MessageError {
+                kind: T::NAME.to_string(),
+                error: format!("failed to serialize message"),
+            });
+            return;
+        };
+
+        let packet = NetworkPacket {
+            kind: String::from(T::NAME),
+            data: serialized_message,
+        };
+
+        match connection.send_message.try_send(packet) {
+            Ok(_) => (),
+            Err(err) => {
+                error!("There was an error sending a packet: {}", err);
+                error_events.send(MessageError {
+                    kind: T::NAME.to_string(),
+                    error: format!("There was an error sending a packet: {}", err),
+                });
+                return;
+            }
+        }
+    }
+}
+
+/// An event that will send a message over the network to the given clients with the given message
+#[derive(Event)]
+pub struct MessageError {
+    kind: String,
+    error: String,
+}
+
+impl MessageError {
+    /// Construct a new [`MessageError`]
+    pub fn new(kind: String, error: String) -> MessageError {
+        Self { kind, error }
+    }
+
+    /// Returns the [`NetworkMessage`] kind that the error occured in relation to
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    /// Returns the actual error string
+    pub fn error(&self) -> &str {
+        &self.error
+    }
 }

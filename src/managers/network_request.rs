@@ -206,19 +206,30 @@ use std::{fmt::Debug, marker::PhantomData, sync::atomic::AtomicU64};
 use async_channel::{Receiver, Sender};
 use bevy::{
     ecs::system::SystemParam,
-    prelude::{debug, App, Event, EventReader, EventWriter, PreUpdate, Res, ResMut, Resource},
+    prelude::{
+        debug, App, Component, Event, EventReader, EventWriter, PreUpdate, Query, Res, ResMut,
+        Resource,
+    },
 };
 use dashmap::DashMap;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::{error::NetworkError, ConnectionId, NetworkData, NetworkMessage, NetworkPacket};
+use crate::{
+    error::NetworkError,
+    managers::network::{send_message, SendMessage},
+    serialize::{bincode_de, bincode_ser, ComponentSerdeFns},
+    ConnectionId, NetworkData, NetworkMessage, NetworkPacket, NetworkSerializedData,
+};
 
-use super::{network::register_message, Network, NetworkProvider};
+use super::{
+    network::{register_message, Network},
+    NetworkInstance, NetworkProvider,
+};
 
-#[derive(SystemParam, Debug)]
+#[derive(SystemParam)]
 /// A wrapper around [`Network`] that allows for the sending of [`RequestMessage`]'s.
 pub struct Requester<'w, 's, T: RequestMessage, NP: NetworkProvider> {
-    server: Res<'w, Network<NP>>,
+    server: Network<'w, 's, NP>,
     response_map: Res<'w, ResponseMap<T>>,
     #[system_param(ignore)]
     marker: PhantomData<&'s usize>,
@@ -227,13 +238,13 @@ pub struct Requester<'w, 's, T: RequestMessage, NP: NetworkProvider> {
 impl<'w, 's, T: RequestMessage, NP: NetworkProvider> Requester<'w, 's, T, NP> {
     /// Sends a request and returns an object that will eventually return the response
     pub fn send_request(
-        &self,
+        &mut self,
         client_id: ConnectionId,
         request: T,
     ) -> Result<Response<T::ResponseMessage>, NetworkError> {
         let (id, response) = self.response_map.get_responder();
         self.server
-            .send_message(client_id, RequestInternal { id, request })?;
+            .send_message(client_id, RequestInternal { id, request });
         Ok(response)
     }
 }
@@ -323,6 +334,8 @@ pub struct Request<T: RequestMessage> {
     source: ConnectionId,
     request_id: u64,
     response_tx: Sender<NetworkPacket>,
+    ser_fn:
+        fn(data: &ResponseInternal<T::ResponseMessage>) -> Result<NetworkSerializedData, String>,
 }
 
 impl<T: RequestMessage> Request<T> {
@@ -342,7 +355,7 @@ impl<T: RequestMessage> Request<T> {
     pub fn respond(self, response: T::ResponseMessage) -> Result<(), NetworkError> {
         let packet = NetworkPacket {
             kind: String::from(T::ResponseMessage::NAME),
-            data: bincode::serialize(&ResponseInternal {
+            data: (self.ser_fn)(&ResponseInternal {
                 response_id: self.request_id,
                 response,
             })
@@ -363,30 +376,36 @@ pub trait AppNetworkRequestMessage {
 
 impl AppNetworkRequestMessage for App {
     fn listen_for_request_message<T: RequestMessage, NP: NetworkProvider>(&mut self) -> &mut Self {
-        let server = self.world.get_resource::<Network<NP>>().expect("Could not find `Network`. Be sure to include the `EventworkPlugin` before listening for server messages.");
-
+        self.world_mut().spawn(ComponentSerdeFns::<T> {
+            de_fn: bincode_de::<T>,
+            ser_fn: bincode_ser::<T>,
+        });
+        let client = self.world().get_resource::<NetworkInstance<NP>>().expect("Could not find `Network`. Be sure to include the `EventworkPlugin` before listening for server messages.");
         debug!(
-            "Registered a new RequestMessage: {}",
+            "Registered a new ServerMessage: {}",
             RequestInternal::<T>::NAME
         );
 
         assert!(
-            !server
+            !client
                 .recv_message_map
                 .contains_key(RequestInternal::<T>::NAME),
             "Duplicate registration of RequestMessage: {}",
             RequestInternal::<T>::NAME
         );
-        server
+        client
             .recv_message_map
             .insert(RequestInternal::<T>::NAME, Vec::new());
+
         self.add_event::<NetworkData<RequestInternal<T>>>();
+        self.add_event::<SendMessage<RequestInternal<T>>>();
         self.add_event::<Request<T>>();
+        self.observe(send_message::<RequestInternal<T>, NP>);
         self.add_systems(
             PreUpdate,
             (
                 create_request_handlers::<T, NP>,
-                register_message::<RequestInternal<T>, NP>,
+                (register_message::<RequestInternal<T>, NP>,),
             ),
         )
     }
@@ -395,18 +414,30 @@ impl AppNetworkRequestMessage for App {
 fn create_request_handlers<T: RequestMessage, NP: NetworkProvider>(
     mut requests: EventReader<NetworkData<RequestInternal<T>>>,
     mut requests_wrapped: EventWriter<Request<T>>,
-    network: Res<Network<NP>>,
+    network: Res<NetworkInstance<NP>>,
+    component_serde: Query<&ComponentResponseDeFns<T>>,
 ) {
     for request in requests.read() {
         if let Some(connection) = &network.established_connections.get(request.source()) {
+            let Ok(serde) = component_serde.get_single() else {
+                panic!("No serde functions found for the requested type");
+            };
             requests_wrapped.send(Request {
                 request: request.request.clone(),
                 request_id: request.id,
                 response_tx: connection.send_message.clone(),
                 source: request.source,
+                ser_fn: serde.response_ser_fn.clone(),
             });
         }
     }
+}
+
+/// Component that holds serialization and deserialization functions for the given T that is wrapped in a [`ResponseInternal`]
+#[derive(Component)]
+pub struct ComponentResponseDeFns<T: RequestMessage> {
+    response_ser_fn:
+        fn(data: &ResponseInternal<T::ResponseMessage>) -> Result<NetworkSerializedData, String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -428,11 +459,10 @@ pub trait AppNetworkResponseMessage {
 impl AppNetworkResponseMessage for App {
     fn listen_for_response_message<T: RequestMessage, NP: NetworkProvider>(&mut self) -> &mut Self {
         self.insert_resource(ResponseMap::<T>::default());
-        let client = self.world.get_resource::<Network<NP>>().expect("Could not find `Network`. Be sure to include the `EventworkPlugin` before listening for server messages.");
-
+        let client = self.world().get_resource::<NetworkInstance<NP>>().expect("Could not find `Network`. Be sure to include the `EventworkPlugin` before listening for server messages.");
         debug!(
-            "Registered a new ResponseMessage: {}",
-            ResponseInternal::<T::ResponseMessage>::NAME
+            "Registered a new ServerMessage: {}",
+            RequestInternal::<T>::NAME
         );
 
         assert!(
@@ -445,7 +475,15 @@ impl AppNetworkResponseMessage for App {
         client
             .recv_message_map
             .insert(ResponseInternal::<T::ResponseMessage>::NAME, Vec::new());
+
+        self.world_mut().spawn(ComponentSerdeFns::<T> {
+            de_fn: bincode_de::<T>,
+            ser_fn: bincode_ser::<T>,
+        });
+        self.observe(send_message::<ResponseInternal<T::ResponseMessage>, NP>);
+
         self.add_event::<NetworkData<ResponseInternal<T::ResponseMessage>>>();
+        self.add_event::<SendMessage<ResponseInternal<T::ResponseMessage>>>();
         self.add_systems(
             PreUpdate,
             (

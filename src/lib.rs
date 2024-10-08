@@ -150,13 +150,16 @@ mod network_message;
 
 /// Contains all functionality for starting a server or client, sending, and recieving messages from clients.
 pub mod managers;
-pub use managers::{network::AppNetworkMessage, Network};
+/// Erased Serialization for the network
+pub mod serialize;
+pub use managers::network::AppNetworkMessage;
 
 mod runtime;
-use managers::NetworkProvider;
+use managers::{network::MessageError, NetworkInstance, NetworkPacketSerdeFn, NetworkProvider};
 pub use runtime::EventworkRuntime;
 use runtime::JoinHandle;
 pub use runtime::Runtime;
+pub use serialize::{ComponentSerdeFns, NetworkDataTypes, NetworkSerializedData};
 
 use std::{
     fmt::{Debug, Display},
@@ -206,7 +209,7 @@ impl Display for ConnectionId {
 /// [`NetworkPacket`]s are untyped packets to be sent over the wire
 pub struct NetworkPacket {
     kind: String,
-    data: Vec<u8>,
+    data: NetworkSerializedData,
 }
 
 impl Debug for NetworkPacket {
@@ -278,10 +281,11 @@ pub struct EventworkPlugin<NP: NetworkProvider, RT: Runtime = bevy::tasks::TaskP
     PhantomData<(NP, RT)>,
 );
 
-impl<NP: NetworkProvider + Default, RT: Runtime> Plugin for EventworkPlugin<NP, RT> {
+impl<NP: NetworkProvider + Default + Clone, RT: Runtime> Plugin for EventworkPlugin<NP, RT> {
     fn build(&self, app: &mut App) {
-        app.insert_resource(managers::Network::new(NP::default()));
-        app.add_event::<NetworkEvent>();
+        app.init_resource::<NetworkPacketSerdeFn>();
+        app.insert_resource(NetworkInstance::new(NP::default()));
+        app.add_event::<NetworkEvent>().add_event::<MessageError>();
         app.add_systems(
             PreUpdate,
             managers::network::handle_new_incoming_connections::<NP, RT>,
