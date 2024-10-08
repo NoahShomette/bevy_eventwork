@@ -155,11 +155,13 @@ pub mod serialize;
 pub use managers::network::AppNetworkMessage;
 
 mod runtime;
-use managers::{network::MessageError, NetworkInstance, NetworkPacketSerdeFn, NetworkProvider};
+use managers::{network::MessageError, NetworkInstance, NetworkProvider};
 pub use runtime::EventworkRuntime;
 use runtime::JoinHandle;
 pub use runtime::Runtime;
-pub use serialize::{ComponentSerdeFns, NetworkDataTypes, NetworkSerializedData};
+pub use serialize::{
+    MessageSerdeFns, NetworkDataTypes, NetworkPacketSerdeFns, NetworkSerializedData,
+};
 
 use std::{
     fmt::{Debug, Display},
@@ -283,7 +285,7 @@ pub struct EventworkPlugin<NP: NetworkProvider, RT: Runtime = bevy::tasks::TaskP
 
 impl<NP: NetworkProvider + Default + Clone, RT: Runtime> Plugin for EventworkPlugin<NP, RT> {
     fn build(&self, app: &mut App) {
-        app.init_resource::<NetworkPacketSerdeFn>();
+        app.init_resource::<NetworkPacketSerdeFns>();
         app.insert_resource(NetworkInstance::new(NP::default()));
         app.add_event::<NetworkEvent>().add_event::<MessageError>();
         app.add_systems(

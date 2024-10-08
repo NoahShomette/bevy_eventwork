@@ -5,12 +5,13 @@ use crate::{
     async_trait,
     error::NetworkError,
     managers::NetworkProvider,
-    NetworkPacket, NetworkSerializedData,
+    NetworkDataTypes, NetworkPacket, NetworkSerializedData,
 };
 use async_net::{TcpListener, TcpStream};
 use bevy::{
     log::{debug, error, info, trace},
     prelude::Resource,
+    utils::HashMap,
 };
 use futures_lite::{AsyncReadExt, AsyncWriteExt, FutureExt, Stream};
 use std::future::Future;
@@ -70,9 +71,15 @@ impl NetworkProvider for TcpProvider {
         mut read_half: Self::ReadHalf,
         messages: Sender<NetworkPacket>,
         settings: Self::NetworkSettings,
-        network_packet_de: fn(data: NetworkSerializedData) -> Result<NetworkPacket, String>,
+        network_packet_de: HashMap<
+            NetworkDataTypes,
+            fn(data: NetworkSerializedData) -> Result<NetworkPacket, String>,
+        >,
     ) {
         let mut buffer = vec![0; settings.max_packet_length];
+        let Some(de_fn) = network_packet_de.get(&NetworkDataTypes::Binary) else {
+            panic!("No Binary serialization fns found for the Network")
+        };
         loop {
             info!("Reading message length");
             let length = match read_half.read(&mut buffer[..8]).await {
@@ -127,7 +134,7 @@ impl NetworkProvider for TcpProvider {
             info!("Message read");
 
             let packet: NetworkPacket =
-                match network_packet_de(NetworkSerializedData::Binary(buffer[..length].to_vec())) {
+                match de_fn(NetworkSerializedData::Binary(buffer[..length].to_vec())) {
                     Ok(packet) => packet,
                     Err(err) => {
                         error!("Failed to decode network packet from: {}", err);
@@ -147,11 +154,19 @@ impl NetworkProvider for TcpProvider {
         mut write_half: Self::WriteHalf,
         messages: Receiver<NetworkPacket>,
         _settings: Self::NetworkSettings,
-        network_packet_ser: fn(data: NetworkPacket) -> Result<NetworkSerializedData, String>,
+        network_packet_ser: HashMap<
+            String,
+            fn(data: NetworkPacket) -> Result<NetworkSerializedData, String>,
+        >,
     ) {
         while let Ok(message) = messages.recv().await {
             let message_kind = message.kind.clone();
-            let encoded = match network_packet_ser(message) {
+
+            let Some(ser_fn) = network_packet_ser.get(&message_kind) else {
+                panic!("No Binary serialization fns found for the Network")
+            };
+
+            let encoded = match ser_fn(message) {
                 Ok(encoded) => encoded,
                 Err(err) => {
                     error!("Could not encode packet {:?}: {}", message_kind, err);
@@ -160,7 +175,7 @@ impl NetworkProvider for TcpProvider {
             };
 
             let encoded = match encoded {
-                NetworkSerializedData::String(_) => continue,
+                NetworkSerializedData::Text(_) => continue,
                 NetworkSerializedData::Binary(vec) => vec,
             };
 

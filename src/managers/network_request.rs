@@ -206,10 +206,7 @@ use std::{fmt::Debug, marker::PhantomData, sync::atomic::AtomicU64};
 use async_channel::{Receiver, Sender};
 use bevy::{
     ecs::system::SystemParam,
-    prelude::{
-        debug, App, Component, Event, EventReader, EventWriter, PreUpdate, Query, Res, ResMut,
-        Resource,
-    },
+    prelude::{debug, App, Event, EventReader, EventWriter, Mut, PreUpdate, Res, ResMut, Resource},
 };
 use dashmap::DashMap;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -217,8 +214,12 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use crate::{
     error::NetworkError,
     managers::network::{send_message, SendMessage},
-    serialize::{bincode_de, bincode_ser, ComponentSerdeFns},
-    ConnectionId, NetworkData, NetworkMessage, NetworkPacket, NetworkSerializedData,
+    serialize::{
+        bincode_de, bincode_network_packet_de, bincode_network_packet_ser, bincode_ser,
+        MessageSerdeFns,
+    },
+    ConnectionId, NetworkData, NetworkDataTypes, NetworkMessage, NetworkPacket,
+    NetworkPacketSerdeFns, NetworkSerializedData,
 };
 
 use super::{
@@ -316,8 +317,11 @@ pub trait RequestMessage:
     const REQUEST_NAME: &'static str;
 }
 
+/// Internal message sent and managed by the app.
+///
+/// Only exposed so that custom serde methods can be made. You should never touch this other than with [`AppNetworkResponseMessage::register_send_request_message_with`] or [`AppNetworkRequestMessage::register_receive_request_message_with`]
 #[derive(Serialize, Deserialize)]
-struct RequestInternal<T> {
+pub struct RequestInternal<T> {
     id: u64,
     request: T,
 }
@@ -370,16 +374,43 @@ impl<T: RequestMessage> Request<T> {
 
 /// A utility trait on [`App`] to easily register [`RequestMessage`]s for the app to recieve
 pub trait AppNetworkRequestMessage {
-    /// Register a request message type to listen for in the app
-    fn listen_for_request_message<T: RequestMessage, NP: NetworkProvider>(&mut self) -> &mut Self;
+    /// Registers the given [`RequestMessage::ResponseMessage`] to be sent and the [`RequestMessage`] to be received using Bincode
+    fn register_receive_request_message<T: RequestMessage, NP: NetworkProvider>(
+        &mut self,
+    ) -> &mut Self;
+
+    /// Registers the given [`RequestMessage::ResponseMessage`] to be sent and the [`RequestMessage`] to be received using custom serde functions
+    fn register_receive_request_message_with<T: RequestMessage, NP: NetworkProvider>(
+        &mut self,
+        data_type: NetworkDataTypes,
+        request_de_fn: fn(data: &NetworkSerializedData) -> Result<RequestInternal<T>, String>,
+        request_ser_fn: fn(data: &RequestInternal<T>) -> Result<NetworkSerializedData, String>,
+        network_packet_de_fn: fn(data: NetworkSerializedData) -> Result<NetworkPacket, String>,
+        network_packet_ser_fn: fn(data: NetworkPacket) -> Result<NetworkSerializedData, String>,
+        response_de_fn: fn(
+            data: &NetworkSerializedData,
+        ) -> Result<ResponseInternal<T::ResponseMessage>, String>,
+        response_ser_fn: fn(
+            data: &ResponseInternal<T::ResponseMessage>,
+        ) -> Result<NetworkSerializedData, String>,
+    ) -> &mut Self;
 }
 
 impl AppNetworkRequestMessage for App {
-    fn listen_for_request_message<T: RequestMessage, NP: NetworkProvider>(&mut self) -> &mut Self {
-        self.world_mut().spawn(ComponentSerdeFns::<T> {
-            de_fn: bincode_de::<T>,
-            ser_fn: bincode_ser::<T>,
-        });
+    fn register_receive_request_message_with<T: RequestMessage, NP: NetworkProvider>(
+        &mut self,
+        data_type: NetworkDataTypes,
+        request_de_fn: fn(data: &NetworkSerializedData) -> Result<RequestInternal<T>, String>,
+        request_ser_fn: fn(data: &RequestInternal<T>) -> Result<NetworkSerializedData, String>,
+        network_packet_de_fn: fn(data: NetworkSerializedData) -> Result<NetworkPacket, String>,
+        network_packet_ser_fn: fn(data: NetworkPacket) -> Result<NetworkSerializedData, String>,
+        response_de_fn: fn(
+            data: &NetworkSerializedData,
+        ) -> Result<ResponseInternal<T::ResponseMessage>, String>,
+        response_ser_fn: fn(
+            data: &ResponseInternal<T::ResponseMessage>,
+        ) -> Result<NetworkSerializedData, String>,
+    ) -> &mut Self {
         let client = self.world().get_resource::<NetworkInstance<NP>>().expect("Could not find `Network`. Be sure to include the `EventworkPlugin` before listening for server messages.");
         debug!(
             "Registered a new ServerMessage: {}",
@@ -396,11 +427,39 @@ impl AppNetworkRequestMessage for App {
         client
             .recv_message_map
             .insert(RequestInternal::<T>::NAME, Vec::new());
-
+        self.world_mut()
+            .insert_resource(MessageSerdeFns::<ResponseInternal<T::ResponseMessage>> {
+                de_fn: response_de_fn,
+                ser_fn: response_ser_fn,
+            });
+        self.world_mut()
+            .insert_resource(MessageSerdeFns::<RequestInternal<T>> {
+                de_fn: request_de_fn,
+                ser_fn: request_ser_fn,
+            });
+        self.world_mut().resource_scope(
+            |_world, mut network_packet_serde_fn: Mut<NetworkPacketSerdeFns>| {
+                network_packet_serde_fn.insert_serialization_method(
+                    ResponseInternal::<T::ResponseMessage>::NAME,
+                    data_type,
+                    network_packet_de_fn,
+                    network_packet_ser_fn,
+                );
+            },
+        );
+        self.world_mut().resource_scope(
+            |_world, mut network_packet_serde_fn: Mut<NetworkPacketSerdeFns>| {
+                network_packet_serde_fn.insert_serialization_method(
+                    T::REQUEST_NAME,
+                    data_type,
+                    network_packet_de_fn,
+                    network_packet_ser_fn,
+                );
+            },
+        );
         self.add_event::<NetworkData<RequestInternal<T>>>();
-        self.add_event::<SendMessage<RequestInternal<T>>>();
         self.add_event::<Request<T>>();
-        self.observe(send_message::<RequestInternal<T>, NP>);
+        self.observe(send_message::<ResponseInternal<T::ResponseMessage>, NP>);
         self.add_systems(
             PreUpdate,
             (
@@ -409,39 +468,46 @@ impl AppNetworkRequestMessage for App {
             ),
         )
     }
+
+    fn register_receive_request_message<T: RequestMessage, NP: NetworkProvider>(
+        &mut self,
+    ) -> &mut Self {
+        self.register_receive_request_message_with::<T, NP>(
+            NetworkDataTypes::Binary,
+            bincode_de::<RequestInternal<T>>,
+            bincode_ser::<RequestInternal<T>>,
+            bincode_network_packet_de,
+            bincode_network_packet_ser,
+            bincode_de::<ResponseInternal<T::ResponseMessage>>,
+            bincode_ser::<ResponseInternal<T::ResponseMessage>>,
+        )
+    }
 }
 
 fn create_request_handlers<T: RequestMessage, NP: NetworkProvider>(
     mut requests: EventReader<NetworkData<RequestInternal<T>>>,
     mut requests_wrapped: EventWriter<Request<T>>,
     network: Res<NetworkInstance<NP>>,
-    component_serde: Query<&ComponentResponseDeFns<T>>,
+    serde: Res<MessageSerdeFns<ResponseInternal<T::ResponseMessage>>>,
 ) {
     for request in requests.read() {
         if let Some(connection) = &network.established_connections.get(request.source()) {
-            let Ok(serde) = component_serde.get_single() else {
-                panic!("No serde functions found for the requested type");
-            };
             requests_wrapped.send(Request {
                 request: request.request.clone(),
                 request_id: request.id,
                 response_tx: connection.send_message.clone(),
                 source: request.source,
-                ser_fn: serde.response_ser_fn.clone(),
+                ser_fn: serde.ser_fn.clone(),
             });
         }
     }
 }
 
-/// Component that holds serialization and deserialization functions for the given T that is wrapped in a [`ResponseInternal`]
-#[derive(Component)]
-pub struct ComponentResponseDeFns<T: RequestMessage> {
-    response_ser_fn:
-        fn(data: &ResponseInternal<T::ResponseMessage>) -> Result<NetworkSerializedData, String>,
-}
-
+/// Internal message sent and managed by the app.
+///
+/// Only exposed so that custom serde methods can be made. You should never touch this other than with [`AppNetworkResponseMessage::register_send_request_message_with`] or [`AppNetworkRequestMessage::register_request_message_with`]
 #[derive(Serialize, Deserialize)]
-struct ResponseInternal<T> {
+pub struct ResponseInternal<T> {
     response_id: u64,
     response: T,
 }
@@ -452,12 +518,43 @@ impl<T: NetworkMessage> NetworkMessage for ResponseInternal<T> {
 
 /// A utility trait on [`App`] to easily register [`RequestMessage::ResponseMessage`]s for clients to recieve
 pub trait AppNetworkResponseMessage {
-    /// Register the response message from the request message type to listen for in the app
-    fn listen_for_response_message<T: RequestMessage, NP: NetworkProvider>(&mut self) -> &mut Self;
+    /// Registers the given [`RequestMessage`] to be sent and the [`RequestMessage::ResponseMessage`] to be received using Bincode
+    fn register_send_request_message<T: RequestMessage, NP: NetworkProvider>(
+        &mut self,
+    ) -> &mut Self;
+
+    /// Registers the given [`RequestMessage`] to be sent and the [`RequestMessage::ResponseMessage`] to be received using custom serde functions
+    fn register_send_request_message_with<T: RequestMessage, NP: NetworkProvider>(
+        &mut self,
+        data_type: NetworkDataTypes,
+        request_de_fn: fn(data: &NetworkSerializedData) -> Result<RequestInternal<T>, String>,
+        request_ser_fn: fn(data: &RequestInternal<T>) -> Result<NetworkSerializedData, String>,
+        network_packet_de_fn: fn(data: NetworkSerializedData) -> Result<NetworkPacket, String>,
+        network_packet_ser_fn: fn(data: NetworkPacket) -> Result<NetworkSerializedData, String>,
+        response_de_fn: fn(
+            data: &NetworkSerializedData,
+        ) -> Result<ResponseInternal<T::ResponseMessage>, String>,
+        response_ser_fn: fn(
+            data: &ResponseInternal<T::ResponseMessage>,
+        ) -> Result<NetworkSerializedData, String>,
+    ) -> &mut Self;
 }
 
 impl AppNetworkResponseMessage for App {
-    fn listen_for_response_message<T: RequestMessage, NP: NetworkProvider>(&mut self) -> &mut Self {
+    fn register_send_request_message_with<T: RequestMessage, NP: NetworkProvider>(
+        &mut self,
+        data_type: NetworkDataTypes,
+        request_de_fn: fn(data: &NetworkSerializedData) -> Result<RequestInternal<T>, String>,
+        request_ser_fn: fn(data: &RequestInternal<T>) -> Result<NetworkSerializedData, String>,
+        network_packet_de_fn: fn(data: NetworkSerializedData) -> Result<NetworkPacket, String>,
+        network_packet_ser_fn: fn(data: NetworkPacket) -> Result<NetworkSerializedData, String>,
+        response_de_fn: fn(
+            data: &NetworkSerializedData,
+        ) -> Result<ResponseInternal<T::ResponseMessage>, String>,
+        response_ser_fn: fn(
+            data: &ResponseInternal<T::ResponseMessage>,
+        ) -> Result<NetworkSerializedData, String>,
+    ) -> &mut Self {
         self.insert_resource(ResponseMap::<T>::default());
         let client = self.world().get_resource::<NetworkInstance<NP>>().expect("Could not find `Network`. Be sure to include the `EventworkPlugin` before listening for server messages.");
         debug!(
@@ -475,12 +572,38 @@ impl AppNetworkResponseMessage for App {
         client
             .recv_message_map
             .insert(ResponseInternal::<T::ResponseMessage>::NAME, Vec::new());
+        self.world_mut()
+            .insert_resource(MessageSerdeFns::<ResponseInternal<T::ResponseMessage>> {
+                de_fn: response_de_fn,
+                ser_fn: response_ser_fn,
+            });
+        self.world_mut()
+            .insert_resource(MessageSerdeFns::<RequestInternal<T>> {
+                de_fn: request_de_fn,
+                ser_fn: request_ser_fn,
+            });
 
-        self.world_mut().spawn(ComponentSerdeFns::<T> {
-            de_fn: bincode_de::<T>,
-            ser_fn: bincode_ser::<T>,
-        });
-        self.observe(send_message::<ResponseInternal<T::ResponseMessage>, NP>);
+        self.world_mut().resource_scope(
+            |_world, mut network_packet_serde_fn: Mut<NetworkPacketSerdeFns>| {
+                network_packet_serde_fn.insert_serialization_method(
+                    ResponseInternal::<T::ResponseMessage>::NAME,
+                    data_type,
+                    network_packet_de_fn,
+                    network_packet_ser_fn,
+                );
+            },
+        );
+        self.world_mut().resource_scope(
+            |_world, mut network_packet_serde_fn: Mut<NetworkPacketSerdeFns>| {
+                network_packet_serde_fn.insert_serialization_method(
+                    T::REQUEST_NAME,
+                    data_type,
+                    network_packet_de_fn,
+                    network_packet_ser_fn,
+                );
+            },
+        );
+        self.observe(send_message::<RequestInternal<T>, NP>);
 
         self.add_event::<NetworkData<ResponseInternal<T::ResponseMessage>>>();
         self.add_event::<SendMessage<ResponseInternal<T::ResponseMessage>>>();
@@ -490,6 +613,20 @@ impl AppNetworkResponseMessage for App {
                 register_message::<ResponseInternal<T::ResponseMessage>, NP>,
                 create_client_response_handlers::<T>,
             ),
+        )
+    }
+
+    fn register_send_request_message<T: RequestMessage, NP: NetworkProvider>(
+        &mut self,
+    ) -> &mut Self {
+        self.register_send_request_message_with::<T, NP>(
+            NetworkDataTypes::Binary,
+            bincode_de::<RequestInternal<T>>,
+            bincode_ser::<RequestInternal<T>>,
+            bincode_network_packet_de,
+            bincode_network_packet_ser,
+            bincode_de::<ResponseInternal<T::ResponseMessage>>,
+            bincode_ser::<ResponseInternal<T::ResponseMessage>>,
         )
     }
 }

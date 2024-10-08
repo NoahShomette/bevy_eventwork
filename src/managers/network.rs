@@ -11,7 +11,7 @@ use bevy::{
     app::{App, PreUpdate},
     ecs::system::SystemParam,
     log::{debug, error, trace, warn},
-    prelude::{Commands, Event, EventWriter, Query, Res, ResMut, Trigger},
+    prelude::{Commands, Event, EventWriter, Mut, Res, ResMut, Trigger},
 };
 use dashmap::DashMap;
 use futures_lite::StreamExt;
@@ -20,12 +20,15 @@ use crate::{
     error::NetworkError,
     network_message::NetworkMessage,
     runtime::{run_async, EventworkRuntime},
-    serialize::{bincode_de, bincode_ser, ComponentSerdeFns},
-    AsyncChannel, Connection, ConnectionId, NetworkData, NetworkEvent, NetworkPacket,
-    NetworkSerializedData, Runtime,
+    serialize::{
+        bincode_de, bincode_network_packet_de, bincode_network_packet_ser, bincode_ser,
+        MessageSerdeFns,
+    },
+    AsyncChannel, Connection, ConnectionId, NetworkData, NetworkDataTypes, NetworkEvent,
+    NetworkPacket, NetworkPacketSerdeFns, NetworkSerializedData, Runtime,
 };
 
-use super::{NetworkInstance, NetworkPacketSerdeFn, NetworkProvider};
+use super::{NetworkInstance, NetworkProvider};
 
 impl<NP: NetworkProvider> std::fmt::Debug for NetworkInstance<NP> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -163,6 +166,11 @@ impl<NP: NetworkProvider> NetworkInstance<NP> {
 }
 
 /// A system param used to interact with the network.
+///
+/// - Listen for new client connections using [`Network::listen`]
+/// - Connect to a server using [`Network::connect`]
+/// - Send new messages using [`Network::send_message`]
+/// - Send broadcasts to all connected clients using [`Network::broadcast`]
 #[derive(SystemParam)]
 pub struct Network<'w, 's, NP: NetworkProvider> {
     network: ResMut<'w, NetworkInstance<NP>>,
@@ -244,7 +252,7 @@ impl<'w, 's, NP: NetworkProvider> Network<'w, 's, NP> {
 
 pub(crate) fn handle_new_incoming_connections<NP: NetworkProvider, RT: Runtime>(
     mut server: ResMut<NetworkInstance<NP>>,
-    network_serde: Res<NetworkPacketSerdeFn>,
+    network_serde: Res<NetworkPacketSerdeFns>,
     runtime: Res<EventworkRuntime<RT>>,
     network_settings: Res<NP::NetworkSettings>,
     mut network_events: EventWriter<NetworkEvent>,
@@ -330,37 +338,32 @@ pub trait AppNetworkMessage {
     /// This will do everything that [`AppNetworkMessage::listen_for_message`] will do but with the given custom ser/de functions and serialization format:
     fn register_message_with<T: NetworkMessage, NP: NetworkProvider>(
         &mut self,
+        data_type: NetworkDataTypes,
         de_fn: fn(data: &NetworkSerializedData) -> Result<T, String>,
         ser_fn: fn(data: &T) -> Result<NetworkSerializedData, String>,
+        network_packet_de_fn: fn(data: NetworkSerializedData) -> Result<NetworkPacket, String>,
+        network_packet_ser_fn: fn(data: NetworkPacket) -> Result<NetworkSerializedData, String>,
     ) -> &mut Self;
 }
 
 impl AppNetworkMessage for App {
     fn register_message<T: NetworkMessage, NP: NetworkProvider>(&mut self) -> &mut Self {
-        let server = self.world().get_resource::<NetworkInstance<NP>>().expect("Could not find `Network`. Be sure to include the `ServerPlugin` before listening for server messages.");
-
-        debug!("Registered a new ServerMessage: {}", T::NAME);
-        assert!(
-            !server.recv_message_map.contains_key(T::NAME),
-            "Duplicate registration of ServerMessage: {}",
-            T::NAME
-        );
-        server.recv_message_map.insert(T::NAME, Vec::new());
-        self.world_mut().spawn(ComponentSerdeFns::<T> {
-            de_fn: bincode_de::<T>,
-            ser_fn: bincode_ser::<T>,
-        });
-        self.observe(send_message::<T, NP>);
-
-        self.add_event::<NetworkData<T>>();
-        self.add_event::<SendMessage<T>>();
-        self.add_systems(PreUpdate, register_message::<T, NP>)
+        self.register_message_with::<T, NP>(
+            NetworkDataTypes::Binary,
+            bincode_de::<T>,
+            bincode_ser::<T>,
+            bincode_network_packet_de,
+            bincode_network_packet_ser,
+        )
     }
 
     fn register_message_with<T: NetworkMessage, NP: NetworkProvider>(
         &mut self,
+        data_type: NetworkDataTypes,
         de_fn: fn(data: &NetworkSerializedData) -> Result<T, String>,
         ser_fn: fn(data: &T) -> Result<NetworkSerializedData, String>,
+        network_packet_de_fn: fn(data: NetworkSerializedData) -> Result<NetworkPacket, String>,
+        network_packet_ser_fn: fn(data: NetworkPacket) -> Result<NetworkSerializedData, String>,
     ) -> &mut Self {
         let server = self.world().get_resource::<NetworkInstance<NP>>().expect("Could not find `Network`. Be sure to include the `ServerPlugin` before listening for server messages.");
 
@@ -373,8 +376,18 @@ impl AppNetworkMessage for App {
         server.recv_message_map.insert(T::NAME, Vec::new());
 
         self.world_mut()
-            .spawn(ComponentSerdeFns::<T> { de_fn, ser_fn });
+            .insert_resource(MessageSerdeFns::<T> { de_fn, ser_fn });
 
+        self.world_mut().resource_scope(
+            |_world, mut network_packet_serde_fn: Mut<NetworkPacketSerdeFns>| {
+                network_packet_serde_fn.insert_serialization_method(
+                    T::NAME,
+                    data_type,
+                    network_packet_de_fn,
+                    network_packet_ser_fn,
+                );
+            },
+        );
         self.observe(send_message::<T, NP>);
 
         self.add_event::<NetworkData<T>>();
@@ -386,7 +399,7 @@ impl AppNetworkMessage for App {
 pub(crate) fn register_message<T, NP: NetworkProvider>(
     net_res: ResMut<NetworkInstance<NP>>,
     mut events: EventWriter<NetworkData<T>>,
-    serde_query: Query<&ComponentSerdeFns<T>>,
+    serde_query: Res<MessageSerdeFns<T>>,
 ) where
     T: NetworkMessage,
 {
@@ -394,13 +407,11 @@ pub(crate) fn register_message<T, NP: NetworkProvider>(
         Some(messages) => messages,
         None => return,
     };
-    if let Ok(serde) = serde_query.get_single() {
-        events.send_batch(messages.drain(..).filter_map(|(source, msg)| {
-            (serde.de_fn)(&msg)
-                .ok()
-                .map(|inner| NetworkData { source, inner })
-        }));
-    };
+    events.send_batch(messages.drain(..).filter_map(|(source, msg)| {
+        (serde_query.de_fn)(&msg)
+            .ok()
+            .map(|inner| NetworkData { source, inner })
+    }));
 }
 
 /// An event that will send a message over the network to the given clients with the given message
@@ -421,7 +432,7 @@ pub(crate) fn send_message<T, NP: NetworkProvider>(
     send_event: Trigger<SendMessage<T>>,
     net_res: ResMut<NetworkInstance<NP>>,
     mut error_events: EventWriter<MessageError>,
-    serde_query: Query<&ComponentSerdeFns<T>>,
+    serde_query: Res<MessageSerdeFns<T>>,
 ) where
     T: NetworkMessage,
 {
@@ -437,11 +448,7 @@ pub(crate) fn send_message<T, NP: NetworkProvider>(
             }
         };
 
-        let Ok(serde) = serde_query.get_single() else {
-            panic!("No serde functions found for the requested type");
-        };
-
-        let Ok(serialized_message) = (serde.ser_fn)(&send_event.event().message) else {
+        let Ok(serialized_message) = (serde_query.ser_fn)(&send_event.event().message) else {
             error_events.send(MessageError {
                 kind: T::NAME.to_string(),
                 error: format!("failed to serialize message"),
