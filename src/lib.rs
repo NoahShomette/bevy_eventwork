@@ -222,6 +222,13 @@ impl Debug for NetworkPacket {
     }
 }
 
+impl NetworkPacket {
+    /// Returns the kind of the [`NetworkPacket`]
+    pub fn kind<'a>(&'a self) -> &'a str {
+        &self.kind
+    }
+}
+
 #[derive(Debug, Event)]
 /// A network event originating from another eventwork app
 pub enum NetworkEvent {
