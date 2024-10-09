@@ -224,8 +224,8 @@ impl Debug for NetworkPacket {
 
 impl NetworkPacket {
     /// Returns the kind of the [`NetworkPacket`]
-    pub fn kind<'a>(&'a self) -> &'a str {
-        &self.kind
+    pub fn kind(&self) -> String {
+        self.kind.clone()
     }
 }
 
