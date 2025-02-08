@@ -7,7 +7,7 @@ use dashmap::DashMap;
 use futures_lite::Stream;
 
 use crate::{
-    error::NetworkError, runtime::JoinHandle, AsyncChannel, Connection, ConnectionId, NetworkPacket,
+    error::NetworkError, runtime::JoinHandle, AsyncChannel, Connection, ConnectionId, NetworkPacket, NetworkData, ConnectionIdGenerator
 };
 
 /// Contains logic for using [`Network`]
@@ -27,13 +27,13 @@ pub mod network_request;
 pub struct Network<NP: NetworkProvider> {
     recv_message_map: Arc<DashMap<&'static str, Vec<(ConnectionId, Vec<u8>)>>>,
     established_connections: Arc<DashMap<ConnectionId, Connection>>,
-    new_connections: AsyncChannel<NP::Socket>,
+    new_connections: AsyncChannel<NetworkData<NP::Socket>>,
     disconnected_connections: AsyncChannel<ConnectionId>,
     error_channel: AsyncChannel<NetworkError>,
     server_handle: Option<Box<dyn JoinHandle>>,
     connection_tasks: Arc<DashMap<u32, Box<dyn JoinHandle>>>,
     connection_task_counts: AtomicU32,
-    connection_count: u32,
+    connection_id_gen: ConnectionIdGenerator,
 }
 
 /// A trait used to drive the network. This is responsible

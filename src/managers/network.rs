@@ -12,7 +12,8 @@ use crate::{
     error::NetworkError,
     network_message::NetworkMessage,
     runtime::{run_async, EventworkRuntime},
-    AsyncChannel, Connection, ConnectionId, NetworkData, NetworkEvent, NetworkPacket, Runtime,
+    AsyncChannel, Connection, ConnectionId, ConnectionIdGenerator, NetworkData, NetworkEvent,
+    NetworkPacket, Runtime,
 };
 
 use super::{Network, NetworkProvider};
@@ -38,7 +39,7 @@ impl<NP: NetworkProvider> Network<NP> {
             server_handle: None,
             connection_tasks: Arc::new(DashMap::new()),
             connection_task_counts: AtomicU32::new(0),
-            connection_count: 0,
+            connection_id_gen: ConnectionIdGenerator::new(),
         }
     }
 
@@ -63,6 +64,7 @@ impl<NP: NetworkProvider> Network<NP> {
         let new_connections = self.new_connections.sender.clone();
         let error_sender = self.error_channel.sender.clone();
         let settings = network_settings.clone();
+        let cid_gen = self.connection_id_gen.clone();
 
         trace!("Started listening");
 
@@ -73,7 +75,10 @@ impl<NP: NetworkProvider> Network<NP> {
                     Ok(mut listen_stream) => {
                         while let Some(connection) = listen_stream.next().await {
                             new_connections
-                                .send(connection)
+                                .send(NetworkData {
+                                    source: cid_gen.next_id(),
+                                    inner: connection,
+                                })
                                 .await
                                 .expect("Connection channel has closed");
                         }
@@ -92,11 +97,11 @@ impl<NP: NetworkProvider> Network<NP> {
 
     /// Start async connecting to a remote server.
     pub fn connect<RT: Runtime>(
-        &self,
+        &mut self,
         connect_info: NP::ConnectInfo,
         runtime: &RT,
         network_settings: &NP::NetworkSettings,
-    ) {
+    ) -> ConnectionId {
         debug!("Starting connection");
 
         let network_error_sender = self.error_channel.sender.clone();
@@ -105,16 +110,22 @@ impl<NP: NetworkProvider> Network<NP> {
 
         let connection_task_weak = Arc::downgrade(&self.connection_tasks);
         let task_count = self.connection_task_counts.fetch_add(1, Ordering::SeqCst);
+        let cid = self.connection_id_gen.next_id();
 
         self.connection_tasks.insert(
             task_count,
             Box::new(run_async(
                 async move {
                     match NP::connect_task(connect_info, settings).await {
-                        Ok(connection) => connection_event_sender
-                            .send(connection)
-                            .await
-                            .expect("Connection channel has closed"),
+                        Ok(connection) => {
+                            return connection_event_sender
+                                .send(NetworkData {
+                                    source: cid,
+                                    inner: connection,
+                                })
+                                .await
+                                .expect("Connection channel has closed");
+                        }
                         Err(e) => network_error_sender
                             .send(e)
                             .await
@@ -130,17 +141,18 @@ impl<NP: NetworkProvider> Network<NP> {
                 runtime,
             )),
         );
+        cid
     }
 
     /// Send a message to a specific client
     pub fn send_message<T: NetworkMessage>(
         &self,
-        client_id: ConnectionId,
+        conn_id: ConnectionId,
         message: T,
     ) -> Result<(), NetworkError> {
-        let connection = match self.established_connections.get(&client_id) {
+        let connection = match self.established_connections.get(&conn_id) {
             Some(conn) => conn,
-            None => return Err(NetworkError::ConnectionNotFound(client_id)),
+            None => return Err(NetworkError::ConnectionNotFound(conn_id)),
         };
 
         let packet = NetworkPacket {
@@ -152,7 +164,7 @@ impl<NP: NetworkProvider> Network<NP> {
             Ok(_) => (),
             Err(err) => {
                 error!("There was an error sending a packet: {}", err);
-                return Err(NetworkError::ChannelClosed(client_id));
+                return Err(NetworkError::ChannelClosed(conn_id));
             }
         }
 
@@ -187,7 +199,10 @@ impl<NP: NetworkProvider> Network<NP> {
             for conn in self.established_connections.iter() {
                 match self.disconnected_connections.sender.try_send(*conn.key()) {
                     Ok(_) => (),
-                    Err(err) => warn!("Could not send to client because: {}", err),
+                    Err(err) => warn!(
+                        "Could not send to disconnected_connections channel because: {}",
+                        err
+                    ),
                 }
             }
             self.established_connections.clear();
@@ -199,45 +214,54 @@ impl<NP: NetworkProvider> Network<NP> {
 
     /// Disconnect a specific client
     pub fn disconnect(&self, conn_id: ConnectionId) -> Result<(), NetworkError> {
-        let connection = if let Some(conn) = self.established_connections.remove(&conn_id) {
-            conn
-        } else {
-            return Err(NetworkError::ConnectionNotFound(conn_id));
+        let connection = match self.established_connections.get(&conn_id) {
+            Some(conn) => conn,
+            None => return Err(NetworkError::ConnectionNotFound(conn_id)),
         };
-
-        connection.1.stop();
-
+        match self
+            .disconnected_connections
+            .sender
+            .try_send(*connection.key())
+        {
+            Ok(_) => (),
+            Err(err) => {
+                warn!(
+                    "Could not send to disconnected_connections channel because: {}",
+                    err
+                );
+                return Err(NetworkError::ChannelClosed(conn_id));
+            }
+        }
         Ok(())
     }
 }
 
-pub(crate) fn handle_new_incoming_connections<NP: NetworkProvider, RT: Runtime>(
-    mut server: ResMut<Network<NP>>,
+pub(crate) fn handle_connections<NP: NetworkProvider, RT: Runtime>(
+    net: ResMut<Network<NP>>,
     runtime: Res<EventworkRuntime<RT>>,
     network_settings: Res<NP::NetworkSettings>,
     mut network_events: EventWriter<NetworkEvent>,
 ) {
-    while let Ok(new_conn) = server.new_connections.receiver.try_recv() {
-        let id = server.connection_count;
-        let conn_id = ConnectionId { id };
-        server.connection_count += 1;
+    while let Ok(new_conn) = net.new_connections.receiver.try_recv() {
+        let conn_id = new_conn.source;
 
-        let (read_half, write_half) = NP::split(new_conn);
-        let recv_message_map = server.recv_message_map.clone();
+        let (read_half, write_half) = NP::split(new_conn.inner);
+        let recv_message_map = net.recv_message_map.clone();
         let read_network_settings = network_settings.clone();
         let write_network_settings = network_settings.clone();
-        let disconnected_connections = server.disconnected_connections.sender.clone();
+        let disconnected_connections = net.disconnected_connections.sender.clone();
 
         let (outgoing_tx, outgoing_rx) = unbounded();
         let (incoming_tx, incoming_rx) = unbounded();
 
-        server.established_connections.insert(
+        net.established_connections.insert(
                 conn_id,
                 Connection {
                     receive_task: Box::new(run_async(async move {
-                        trace!("Starting listen task for {}", id);
+                        trace!("Starting listen task for {}", conn_id);
                         NP::recv_loop(read_half, incoming_tx, read_network_settings).await;
 
+                        debug!("{} disconnected!", conn_id);
                         match disconnected_connections.send(conn_id).await {
                             Ok(_) => (),
                             Err(_) => {
@@ -256,22 +280,25 @@ pub(crate) fn handle_new_incoming_connections<NP: NetworkProvider, RT: Runtime>(
                         }
                     }, &runtime.0)),
                     send_task: Box::new(run_async(async move {
-                        trace!("Starting send task for {}", id);
+                        trace!("Starting send task for {}", conn_id);
                         NP::send_loop(write_half, outgoing_rx, write_network_settings).await;
                     }, &runtime.0)),
                     send_message: outgoing_tx,
-                    //addr: new_conn.addr,
+                    //addr: new_conn.inner.addr,
                 },
             );
 
         network_events.send(NetworkEvent::Connected(conn_id));
     }
 
-    while let Ok(disconnected_connection) = server.disconnected_connections.receiver.try_recv() {
-        server
+    while let Ok(disconnected_connection_id) = net.disconnected_connections.receiver.try_recv() {
+        if let Some(conn) = net
             .established_connections
-            .remove(&disconnected_connection);
-        network_events.send(NetworkEvent::Disconnected(disconnected_connection));
+            .remove(&disconnected_connection_id)
+        {
+            conn.1.stop();
+        }
+        network_events.send(NetworkEvent::Disconnected(disconnected_connection_id));
     }
 }
 
@@ -289,16 +316,16 @@ pub trait AppNetworkMessage {
 
 impl AppNetworkMessage for App {
     fn listen_for_message<T: NetworkMessage, NP: NetworkProvider>(&mut self) -> &mut Self {
-        let server = self.world().get_resource::<Network<NP>>().expect("Could not find `Network`. Be sure to include the `ServerPlugin` before listening for server messages.");
+        let net = self.world().get_resource::<Network<NP>>().expect("Could not find `Network`. Be sure to include the `ServerPlugin` before listening for server messages.");
 
         debug!("Registered a new ServerMessage: {}", T::NAME);
 
         assert!(
-            !server.recv_message_map.contains_key(T::NAME),
+            !net.recv_message_map.contains_key(T::NAME),
             "Duplicate registration of ServerMessage: {}",
             T::NAME
         );
-        server.recv_message_map.insert(T::NAME, Vec::new());
+        net.recv_message_map.insert(T::NAME, Vec::new());
         self.add_event::<NetworkData<T>>();
         self.add_systems(PreUpdate, register_message::<T, NP>)
     }

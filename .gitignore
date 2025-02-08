@@ -1,4 +1,3 @@
-# Rust build files
+Cargo.lock
 /target
-
 */target

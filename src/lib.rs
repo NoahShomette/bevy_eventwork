@@ -176,6 +176,30 @@ use std::ops::Deref;
 /// A default tcp provider to help get you started.
 pub mod tcp;
 
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+
+/// A thread-safe `ConnectionId` generator.
+#[derive(Debug, Clone)]
+pub struct ConnectionIdGenerator {
+    counter: Arc<AtomicU32>,
+}
+
+impl ConnectionIdGenerator {
+    /// Creates a new `ConnectionIdGenerator` starting at `0`.
+    pub fn new() -> Self {
+        Self {
+            counter: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    /// Generates the next `ConnectionId`.
+    pub fn next_id(&self) -> ConnectionId {
+        let id = self.counter.fetch_add(1, Ordering::Relaxed);
+        ConnectionId { id }
+    }
+}
+
 struct AsyncChannel<T> {
     pub(crate) sender: Sender<T>,
     pub(crate) receiver: Receiver<T>,
@@ -282,9 +306,6 @@ impl<NP: NetworkProvider + Default, RT: Runtime> Plugin for EventworkPlugin<NP, 
     fn build(&self, app: &mut App) {
         app.insert_resource(Network::new(NP::default()));
         app.add_event::<NetworkEvent>();
-        app.add_systems(
-            PreUpdate,
-            managers::network::handle_new_incoming_connections::<NP, RT>,
-        );
+        app.add_systems(PreUpdate, managers::network::handle_connections::<NP, RT>);
     }
 }
