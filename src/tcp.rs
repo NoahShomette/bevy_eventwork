@@ -69,6 +69,7 @@ impl NetworkProvider for TcpProvider {
     async fn recv_loop(
         mut read_half: Self::ReadHalf,
         messages: Sender<NetworkPacket>,
+        errors: Sender<NetworkError>,
         settings: Self::NetworkSettings,
     ) {
         let mut buffer = vec![0; settings.max_packet_length];
@@ -80,6 +81,10 @@ impl NetworkProvider for TcpProvider {
                     info!("Client disconnected");
                     // TODO: probably want to do more than just quit the receive task.
                     //       to let eventwork know that the peer disconnected.
+                    errors
+                        .send(NetworkError::ConnectionClosed)
+                        .await
+                        .expect("Error channel has closed.");
                     break;
                 }
                 Ok(8) => {
@@ -95,11 +100,19 @@ impl NetworkProvider for TcpProvider {
                         "Could not read enough bytes for header. Expected 8, got {}",
                         n
                     );
-                    break;
+                    errors
+                        .send(NetworkError::ReceiveError)
+                        .await
+                        .expect("Error channel has closed.");
+                    continue;
                 }
                 Err(err) => {
                     error!("Encountered error while fetching length: {}", err);
-                    break;
+                    errors
+                        .send(NetworkError::ReceiveError)
+                        .await
+                        .expect("Error channel has closed.");
+                    continue;
                 }
             };
             info!("Message length: {}", length);
@@ -109,7 +122,11 @@ impl NetworkProvider for TcpProvider {
                     "Received too large packet: {} > {}",
                     length, settings.max_packet_length
                 );
-                break;
+                errors
+                    .send(NetworkError::ReceiveError)
+                    .await
+                    .expect("Error channel has closed.");
+                continue;
             }
 
             info!("Reading message into buffer");
@@ -120,7 +137,11 @@ impl NetworkProvider for TcpProvider {
                         "Encountered error while fetching stream of length {}: {}",
                         length, err
                     );
-                    break;
+                    errors
+                        .send(NetworkError::ReceiveError)
+                        .await
+                        .expect("Error channel has closed.");
+                    continue;
                 }
             }
             info!("Message read");
@@ -129,13 +150,21 @@ impl NetworkProvider for TcpProvider {
                 Ok(packet) => packet,
                 Err(err) => {
                     error!("Failed to decode network packet from: {}", err);
-                    break;
+                    errors
+                        .send(NetworkError::Serialization)
+                        .await
+                        .expect("Error channel has closed.");
+                    continue;
                 }
             };
 
             if messages.send(packet).await.is_err() {
                 error!("Failed to send decoded message to eventwork");
-                break;
+                errors
+                    .send(NetworkError::SendError)
+                    .await
+                    .expect("Error channel has closed.");
+                continue;
             }
             info!("Message deserialized and sent to eventwork");
         }
@@ -144,6 +173,7 @@ impl NetworkProvider for TcpProvider {
     async fn send_loop(
         mut write_half: Self::WriteHalf,
         messages: Receiver<NetworkPacket>,
+        errors: Sender<NetworkError>,
         _settings: Self::NetworkSettings,
     ) {
         while let Ok(message) = messages.recv().await {
@@ -151,6 +181,10 @@ impl NetworkProvider for TcpProvider {
                 Ok(encoded) => encoded,
                 Err(err) => {
                     error!("Could not encode packet {:?}: {}", message, err);
+                    errors
+                        .send(NetworkError::Serialization)
+                        .await
+                        .expect("Error channel has closed.");
                     continue;
                 }
             };
@@ -162,7 +196,11 @@ impl NetworkProvider for TcpProvider {
                 Ok(_) => (),
                 Err(err) => {
                     error!("Could not send packet length: {:?}: {}", len, err);
-                    break;
+                    errors
+                        .send(NetworkError::SendError)
+                        .await
+                        .expect("Error channel has closed.");
+                    continue;
                 }
             }
 
@@ -172,7 +210,11 @@ impl NetworkProvider for TcpProvider {
                 Ok(_) => (),
                 Err(err) => {
                     error!("Could not send packet: {:?}: {}", message, err);
-                    break;
+                    errors
+                        .send(NetworkError::SendError)
+                        .await
+                        .expect("Error channel has closed.");
+                    continue;
                 }
             }
 

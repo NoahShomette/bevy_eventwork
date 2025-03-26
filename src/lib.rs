@@ -153,7 +153,7 @@ pub mod managers;
 pub use managers::{network::AppNetworkMessage, Network};
 
 mod runtime;
-use managers::NetworkProvider;
+use managers::{network::receive_and_send_network_errors, NetworkProvider};
 pub use runtime::EventworkRuntime;
 use runtime::JoinHandle;
 pub use runtime::Runtime;
@@ -216,6 +216,10 @@ impl Debug for NetworkPacket {
             .finish()
     }
 }
+
+/// Event sent by app when the network encounters an error
+#[derive(Event)]
+pub struct NetworkErrorEvent(pub NetworkError);
 
 #[derive(Debug, Event)]
 /// A network event originating from another eventwork app
@@ -281,10 +285,14 @@ pub struct EventworkPlugin<NP: NetworkProvider, RT: Runtime = bevy::tasks::TaskP
 impl<NP: NetworkProvider + Default, RT: Runtime> Plugin for EventworkPlugin<NP, RT> {
     fn build(&self, app: &mut App) {
         app.insert_resource(Network::new(NP::default()));
-        app.add_event::<NetworkEvent>();
+        app.add_event::<NetworkEvent>()
+            .add_event::<NetworkErrorEvent>();
         app.add_systems(
             PreUpdate,
-            managers::network::handle_new_incoming_connections::<NP, RT>,
+            (
+                managers::network::handle_new_incoming_connections::<NP, RT>,
+                receive_and_send_network_errors::<NP>,
+            ),
         );
     }
 }

@@ -79,6 +79,7 @@ pub trait NetworkProvider: 'static + Send + Sync {
     async fn recv_loop(
         read_half: Self::ReadHalf,
         messages: Sender<NetworkPacket>,
+        errors: Sender<NetworkError>,
         settings: Self::NetworkSettings,
     );
 
@@ -86,6 +87,7 @@ pub trait NetworkProvider: 'static + Send + Sync {
     async fn send_loop(
         write_half: Self::WriteHalf,
         messages: Receiver<NetworkPacket>,
+        errors: Sender<NetworkError>,
         settings: Self::NetworkSettings,
     );
 
