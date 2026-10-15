@@ -1,6 +1,6 @@
 [package]
 name = "bevy_eventwork"
-version = "0.10.0"
+version = "0.11.0"
 authors = [
     "James <jamescarterbell@gmail.com>",
     "Neikos <neikos@neikos.email>",

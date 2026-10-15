@@ -79,9 +79,9 @@ fn main() {
 
 ```rust
 fn handle_incoming_whisper_messages(
-    mut whisper_messages: EventReader<NetworkMessage<WhisperMessage>>,
+    mut whisper_messages: MessageReader<NetworkMessage<WhisperMessage>>,
 ) {
-    for whisper_message in whisper_messages.iter() {
+    for whisper_message in whisper_messages.read() {
         // Handle the whisper
     }
 }
@@ -97,6 +97,7 @@ Simply pick the version compatible to your bevy version:
 
 | Bevy Eventwork | Bevy |
 | :------------: | :--: |
+|      0.11       | 0.20 |
 |      0.10       | 0.15 |
 |      0.9       | 0.14 |
 |      0.8       | 0.13 |
@@ -134,11 +135,11 @@ The above three platforms are officially supported. **MacOS** should work but I 
 
 |                                                 Name                                                  | Version |
 | :---------------------------------------------------------------------------------------------------: | :-----: |
-|                                       eventwork_tcp (included)                                        |   0.10   |
-| bevy_eventwork_mod_websockets ([LINK](https://github.com/NoahShomette/bevy_eventwork_mod_websockets)) |   0.3   |
+|                                       eventwork_tcp (included)                                        |   0.11   |
+| bevy_eventwork_mod_websockets ([LINK](https://github.com/NoahShomette/bevy_eventwork_mod_websockets)) |   0.4   |
 
 ## Contributing
 
 To contribute, simply fork the repository and send a PR.
 
-Feel free to chat me up on the bevy discord under `@SirCarter#8209` if you have any questions, suggestions, or I'm not looking into your PR fast enough and you need someone to yell at (respectfully of course).
+Feel free to chat me up on the bevy discord under `@nickhaldon` if you have any questions, suggestions, or I'm not looking into your PR fast enough and you need someone to yell at (respectfully of course).
