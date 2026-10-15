@@ -35,6 +35,7 @@ name = "server"
 # This is a bevy plugin
 bevy = { version = "0.20", features = [
     "multi_threaded",
+    "bevy_log"
 ], default-features = false }
 # Used for on wire serialization
 bincode = "1.3.3"
