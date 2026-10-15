@@ -54,14 +54,14 @@ fn main() {
 }
 
 fn handle_world_updates(
-    mut chunk_updates: EventReader<NetworkData<WorldUpdate>>,
+    mut chunk_updates: MessageReader<NetworkData<WorldUpdate>>,
 ) {
     for chunk in chunk_updates.read() {
         info!("Got chunk update!");
     }
 }
 
-fn handle_connection_events(mut network_events: EventReader<NetworkEvent>,) {
+fn handle_connection_events(mut network_events: MessageReader<NetworkEvent>,) {
     for event in network_events.read() {
         match event {
             &NetworkEvent::Connected(_) => info!("Connected to server!"),
@@ -109,7 +109,7 @@ fn main() {
 }
 
 fn handle_world_updates(
-    mut chunk_updates: EventReader<NetworkData<UserInput>>,
+    mut chunk_updates: MessageReader<NetworkData<UserInput>>,
 ) {
     for chunk in chunk_updates.read() {
         info!("Got chunk update!");
@@ -125,7 +125,7 @@ impl NetworkMessage for PlayerUpdate {
 
 fn handle_connection_events(
     net: Res<Network<TcpProvider>>,
-    mut network_events: EventReader<NetworkEvent>,
+    mut network_events: MessageReader<NetworkEvent>,
 ) {
     for event in network_events.read() {
         match event {
@@ -218,10 +218,10 @@ impl Debug for NetworkPacket {
 }
 
 /// Event sent by app when the network encounters an error
-#[derive(Event)]
+#[derive(Message)]
 pub struct NetworkErrorEvent(pub NetworkError);
 
-#[derive(Debug, Event)]
+#[derive(Debug, Message)]
 /// A network event originating from another eventwork app
 pub enum NetworkEvent {
     /// A new client has connected
@@ -232,7 +232,7 @@ pub enum NetworkEvent {
     Error(NetworkError),
 }
 
-#[derive(Debug, Event)]
+#[derive(Debug, Message)]
 /// [`NetworkData`] is what is sent over the bevy event system
 ///
 /// Please check the root documentation how to up everything
@@ -285,8 +285,8 @@ pub struct EventworkPlugin<NP: NetworkProvider, RT: Runtime = bevy::tasks::TaskP
 impl<NP: NetworkProvider + Default, RT: Runtime> Plugin for EventworkPlugin<NP, RT> {
     fn build(&self, app: &mut App) {
         app.insert_resource(Network::new(NP::default()));
-        app.add_event::<NetworkEvent>()
-            .add_event::<NetworkErrorEvent>();
+        app.add_message::<NetworkEvent>()
+            .add_message::<NetworkErrorEvent>();
         app.add_systems(
             PreUpdate,
             (

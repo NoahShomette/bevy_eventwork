@@ -44,7 +44,7 @@
 //!     /// The type of message that the server will send back to the client.
 //!     /// It must implement [`NetworkMessage`]
 //!    type ResponseMessage = StatusResponse;
-//!    
+//!
 //!     /// A unique identifying name for the request message.
 //!    const REQUEST_NAME: &'static str = "client_request_status";
 //! }
@@ -103,7 +103,7 @@
 //!         app.add_systems(Update, poll_responses);
 //!     }
 //!
-//! }        
+//! }
 //!
 //! /// A resource that will hold our response object so we can poll it every frame
 //! #[derive(Resource)]
@@ -186,17 +186,17 @@
 //!         app.add_systems(Update, handle_request_status);
 //!     }
 //!
-//! }        
+//! }
 //!
 //! /// A system that will read status requests and return the current status of the app.
 //! fn handle_request_status(
-//!     mut network_events: EventReader<Request<RequestStatus>>,
+//!     mut network_events: MessageReader<Request<RequestStatus>>,
 //! ){
 //!     for event in network_events.read() {
 //!         let _ = event.clone().respond(StatusResponse{
-//!             response: true    
+//!             response: true
 //!         });
-//!         
+//!
 //!     }
 //! }
 //! ```
@@ -205,8 +205,8 @@ use std::{fmt::Debug, marker::PhantomData, sync::atomic::AtomicU64};
 
 use async_channel::{Receiver, Sender};
 use bevy::{
-    ecs::system::SystemParam,
-    prelude::{debug, App, Event, EventReader, EventWriter, PreUpdate, Res, ResMut, Resource},
+    ecs::{message::Message, system::SystemParam},
+    prelude::{debug, App, MessageReader, MessageWriter, PreUpdate, Res, ResMut, Resource},
 };
 use dashmap::DashMap;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -220,7 +220,6 @@ use super::{network::register_message, Network, NetworkProvider};
 pub struct Requester<'w, 's, T: RequestMessage, NP: NetworkProvider> {
     server: Res<'w, Network<NP>>,
     response_map: Res<'w, ResponseMap<T>>,
-    #[system_param(ignore)]
     marker: PhantomData<&'s usize>,
 }
 
@@ -317,7 +316,7 @@ impl<T: RequestMessage> NetworkMessage for RequestInternal<T> {
 
 /// A wrapper around a request that allows sending a response that will automatically be written
 ///  to eventwork for network transmission.
-#[derive(Debug, Event, Clone)]
+#[derive(Debug, Message, Clone)]
 pub struct Request<T: RequestMessage> {
     request: T,
     source: ConnectionId,
@@ -380,8 +379,8 @@ impl AppNetworkRequestMessage for App {
         server
             .recv_message_map
             .insert(RequestInternal::<T>::NAME, Vec::new());
-        self.add_event::<NetworkData<RequestInternal<T>>>();
-        self.add_event::<Request<T>>();
+        self.add_message::<NetworkData<RequestInternal<T>>>();
+        self.add_message::<Request<T>>();
         self.add_systems(
             PreUpdate,
             (
@@ -393,13 +392,13 @@ impl AppNetworkRequestMessage for App {
 }
 
 fn create_request_handlers<T: RequestMessage, NP: NetworkProvider>(
-    mut requests: EventReader<NetworkData<RequestInternal<T>>>,
-    mut requests_wrapped: EventWriter<Request<T>>,
+    mut requests: MessageReader<NetworkData<RequestInternal<T>>>,
+    mut requests_wrapped: MessageWriter<Request<T>>,
     network: Res<Network<NP>>,
 ) {
     for request in requests.read() {
         if let Some(connection) = &network.established_connections.get(request.source()) {
-            requests_wrapped.send(Request {
+            requests_wrapped.write(Request {
                 request: request.request.clone(),
                 request_id: request.id,
                 response_tx: connection.send_message.clone(),
@@ -445,7 +444,7 @@ impl AppNetworkResponseMessage for App {
         client
             .recv_message_map
             .insert(ResponseInternal::<T::ResponseMessage>::NAME, Vec::new());
-        self.add_event::<NetworkData<ResponseInternal<T::ResponseMessage>>>();
+        self.add_message::<NetworkData<ResponseInternal<T::ResponseMessage>>>();
         self.add_systems(
             PreUpdate,
             (
@@ -457,7 +456,7 @@ impl AppNetworkResponseMessage for App {
 }
 
 fn create_client_response_handlers<T: RequestMessage>(
-    mut responses: EventReader<NetworkData<ResponseInternal<T::ResponseMessage>>>,
+    mut responses: MessageReader<NetworkData<ResponseInternal<T::ResponseMessage>>>,
     response_map: ResMut<ResponseMap<T>>,
 ) {
     for response in responses.read() {

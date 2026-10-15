@@ -216,7 +216,7 @@ pub(crate) fn handle_new_incoming_connections<NP: NetworkProvider, RT: Runtime>(
     mut server: ResMut<Network<NP>>,
     runtime: Res<EventworkRuntime<RT>>,
     network_settings: Res<NP::NetworkSettings>,
-    mut network_events: EventWriter<NetworkEvent>,
+    mut network_events: MessageWriter<NetworkEvent>,
 ) {
     while let Ok(new_conn) = server.new_connections.receiver.try_recv() {
         let id = server.connection_count;
@@ -267,23 +267,23 @@ pub(crate) fn handle_new_incoming_connections<NP: NetworkProvider, RT: Runtime>(
                 },
             );
 
-        network_events.send(NetworkEvent::Connected(conn_id));
+        network_events.write(NetworkEvent::Connected(conn_id));
     }
 
     while let Ok(disconnected_connection) = server.disconnected_connections.receiver.try_recv() {
         server
             .established_connections
             .remove(&disconnected_connection);
-        network_events.send(NetworkEvent::Disconnected(disconnected_connection));
+        network_events.write(NetworkEvent::Disconnected(disconnected_connection));
     }
 }
 
 pub(crate) fn receive_and_send_network_errors<NP: NetworkProvider>(
     net: ResMut<Network<NP>>,
-    mut error_writer: EventWriter<NetworkErrorEvent>,
+    mut error_writer: MessageWriter<NetworkErrorEvent>,
 ) {
     while let Ok(error) = net.error_channel.receiver.try_recv() {
-        error_writer.send(NetworkErrorEvent(error));
+        error_writer.write(NetworkErrorEvent(error));
     }
 }
 
@@ -311,14 +311,14 @@ impl AppNetworkMessage for App {
             T::NAME
         );
         server.recv_message_map.insert(T::NAME, Vec::new());
-        self.add_event::<NetworkData<T>>();
+        self.add_message::<NetworkData<T>>();
         self.add_systems(PreUpdate, register_message::<T, NP>)
     }
 }
 
 pub(crate) fn register_message<T, NP: NetworkProvider>(
     net_res: ResMut<Network<NP>>,
-    mut events: EventWriter<NetworkData<T>>,
+    mut events: MessageWriter<NetworkData<T>>,
 ) where
     T: NetworkMessage,
 {
@@ -327,7 +327,7 @@ pub(crate) fn register_message<T, NP: NetworkProvider>(
         None => return,
     };
 
-    events.send_batch(messages.drain(..).filter_map(|(source, msg)| {
+    events.write_batch(messages.drain(..).filter_map(|(source, msg)| {
         bincode::deserialize::<T>(&msg)
             .ok()
             .map(|inner| NetworkData { source, inner })

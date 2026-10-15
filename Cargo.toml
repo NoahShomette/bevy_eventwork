@@ -33,7 +33,7 @@ name = "server"
 
 [dependencies]
 # This is a bevy plugin
-bevy = { version = "0.15", features = [
+bevy = { version = "0.20", features = [
     "multi_threaded",
 ], default-features = false }
 # Used for on wire serialization
@@ -53,4 +53,4 @@ async-net = { version = "2.0.0", optional = true }
 futures-lite = "2.5.0"
 
 [dev-dependencies]
-bevy = { version = "0.15", features = ["default_font"] }
+bevy = { version = "0.20", features = ["default_font"] }

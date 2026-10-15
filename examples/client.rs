@@ -4,8 +4,9 @@ use async_net::{Ipv4Addr, SocketAddr};
 use bevy::{
     color::palettes,
     prelude::*,
-    state::commands,
     tasks::{TaskPool, TaskPoolBuilder},
+    ui::Pressed,
+    ui_widgets::Button,
 };
 use bevy_eventwork::{ConnectionId, EventworkRuntime, Network, NetworkData, NetworkEvent};
 use std::net::IpAddr;
@@ -62,25 +63,21 @@ fn main() {
 ///////////////////////////////////////////////////////////////
 
 fn handle_incoming_messages(
-    mut messages: Query<&mut GameChatMessages>,
-    mut new_messages: EventReader<NetworkData<shared::NewChatMessage>>,
+    mut messages: Single<&mut GameChatMessages>,
+    mut new_messages: MessageReader<NetworkData<shared::NewChatMessage>>,
 ) {
-    let mut messages = messages.get_single_mut().unwrap();
-
     for new_message in new_messages.read() {
         messages.add(UserMessage::new(&new_message.name, &new_message.message));
     }
 }
 
 fn handle_network_events(
-    mut new_network_events: EventReader<NetworkEvent>,
-    connect_query: Query<&Children, With<ConnectButton>>,
+    mut new_network_events: MessageReader<NetworkEvent>,
+    connect_query: Single<&Children, With<ConnectButton>>,
     mut text_query: Query<&mut Text>,
-    mut messages: Query<&mut GameChatMessages>,
+    mut messages: Single<&mut GameChatMessages>,
 ) {
-    let connect_children = connect_query.get_single().unwrap();
-    let mut text = text_query.get_mut(connect_children[0]).unwrap();
-    let mut messages = messages.get_single_mut().unwrap();
+    let mut text = text_query.get_mut(connect_query[0]).unwrap();
 
     for event in new_network_events.read() {
         info!("Received event");
@@ -212,23 +209,19 @@ struct ConnectButton;
 fn handle_connect_button(
     net: ResMut<Network<TcpProvider>>,
     settings: Res<NetworkSettings>,
-    interaction_query: Query<
-        (&Interaction, &Children),
-        (Changed<Interaction>, With<ConnectButton>),
-    >,
+    interaction_query: Query<(Has<Pressed>, &Children), (Changed<Pressed>, With<ConnectButton>)>,
     mut text_query: Query<&mut Text>,
-    mut messages: Query<&mut GameChatMessages>,
+    messages: Option<Single<&mut GameChatMessages>>,
     task_pool: Res<EventworkRuntime<TaskPool>>,
 ) {
-    let mut messages = if let Ok(messages) = messages.get_single_mut() {
-        messages
-    } else {
+    let Some(mut messages) = messages else {
         return;
     };
 
-    for (interaction, children) in interaction_query.iter() {
+    for (pressed, children) in interaction_query.iter() {
         let mut text = text_query.get_mut(children[0]).unwrap();
-        if let Interaction::Pressed = interaction {
+
+        if pressed {
             if net.has_connections() {
                 net.disconnect(ConnectionId { id: 0 })
                     .expect("Couldn't disconnect from server!");
@@ -251,17 +244,14 @@ struct MessageButton;
 
 fn handle_message_button(
     net: Res<Network<TcpProvider>>,
-    interaction_query: Query<&Interaction, (Changed<Interaction>, With<MessageButton>)>,
-    mut messages: Query<&mut GameChatMessages>,
+    interaction_query: Query<Has<Pressed>, (Changed<Pressed>, With<MessageButton>)>,
+    messages: Option<Single<&mut GameChatMessages>>,
 ) {
-    let mut messages = if let Ok(messages) = messages.get_single_mut() {
-        messages
-    } else {
+    let Some(mut messages) = messages else {
         return;
     };
-
     for interaction in interaction_query.iter() {
-        if let Interaction::Pressed = interaction {
+        if interaction {
             match net.send_message(
                 ConnectionId { id: 0 },
                 shared::UserChatMessage {
@@ -283,17 +273,16 @@ struct ChatArea;
 
 fn handle_chat_area(
     chat_settings: Res<GlobalChatSettings>,
-    messages: Query<&GameChatMessages, Changed<GameChatMessages>>,
-    mut chat_text_query: Query<(Entity, &mut Text), With<ChatArea>>,
+    messages: Option<Single<&mut GameChatMessages, Changed<GameChatMessages>>>,
+    chat_text_query: Single<(Entity, &mut Text), With<ChatArea>>,
     mut read_messages_index: Local<usize>,
     mut commands: Commands,
 ) {
-    let messages = if let Ok(messages) = messages.get_single() {
-        messages
-    } else {
+    let Some(messages) = messages else {
         return;
     };
-    let (text_entity, mut text) = chat_text_query.get_single_mut().unwrap();
+
+    let (text_entity, _) = chat_text_query.into_inner();
 
     for message_index in *read_messages_index..messages.messages.len() {
         let message = &messages.messages[message_index];
@@ -374,7 +363,7 @@ fn setup_ui(mut commands: Commands, _materials: ResMut<Assets<ColorMaterial>>) {
                                 Text::new("Send Message!"),
                                 TextFont::from_font_size(40.0),
                                 TextColor::from(Color::BLACK),
-                                TextLayout::new_with_justify(JustifyText::Center),
+                                TextLayout::justify(Justify::Center),
                             ));
                         });
 
@@ -395,7 +384,7 @@ fn setup_ui(mut commands: Commands, _materials: ResMut<Assets<ColorMaterial>>) {
                                 Text::new("Connect to server"),
                                 TextFont::from_font_size(40.0),
                                 TextColor::from(Color::BLACK),
-                                TextLayout::new_with_justify(JustifyText::Center),
+                                TextLayout::justify(Justify::Center),
                             ));
                         });
                 });

@@ -7,15 +7,15 @@
         ]
       },
       "locked": {
-        "lastModified": 1791539461,
-        "narHash": "sha256-y41vqqx8agIdKF1f8Zo8NI/Ga6w36Lp2//jf+NYvfhg=",
-        "owner": "swagtop",
+        "lastModified": 1791945222,
+        "narHash": "sha256-1Zk4eKa6ZmrlUoDBInIhe1hV8VClplUuKsKQCRaiDIM=",
+        "owner": "noahshomette",
         "repo": "bevy-flake",
-        "rev": "3106762e3a01bd02e5c5efa54ac43969d38c668c",
+        "rev": "d5f18ec3716afb98f949ece72af7d883e4c5a521",
         "type": "github"
       },
       "original": {
-        "owner": "swagtop",
+        "owner": "noahshomette",
         "repo": "bevy-flake",
         "type": "github"
       }
