@@ -12,7 +12,8 @@ use crate::{
     error::NetworkError,
     network_message::NetworkMessage,
     runtime::{run_async, EventworkRuntime},
-    AsyncChannel, Connection, ConnectionId, NetworkData, NetworkEvent, NetworkPacket, Runtime,
+    AsyncChannel, Connection, ConnectionId, NetworkData, NetworkErrorEvent, NetworkEvent,
+    NetworkPacket, Runtime,
 };
 
 use super::{Network, NetworkProvider};
@@ -227,6 +228,8 @@ pub(crate) fn handle_new_incoming_connections<NP: NetworkProvider, RT: Runtime>(
         let read_network_settings = network_settings.clone();
         let write_network_settings = network_settings.clone();
         let disconnected_connections = server.disconnected_connections.sender.clone();
+        let read_network_error_sender = server.error_channel.sender.clone();
+        let send_network_error_sender = server.error_channel.sender.clone();
 
         let (outgoing_tx, outgoing_rx) = unbounded();
         let (incoming_tx, incoming_rx) = unbounded();
@@ -236,7 +239,7 @@ pub(crate) fn handle_new_incoming_connections<NP: NetworkProvider, RT: Runtime>(
                 Connection {
                     receive_task: Box::new(run_async(async move {
                         trace!("Starting listen task for {}", id);
-                        NP::recv_loop(read_half, incoming_tx, read_network_settings).await;
+                        NP::recv_loop(read_half, incoming_tx,read_network_error_sender, read_network_settings).await;
 
                         match disconnected_connections.send(conn_id).await {
                             Ok(_) => (),
@@ -257,7 +260,7 @@ pub(crate) fn handle_new_incoming_connections<NP: NetworkProvider, RT: Runtime>(
                     }, &runtime.0)),
                     send_task: Box::new(run_async(async move {
                         trace!("Starting send task for {}", id);
-                        NP::send_loop(write_half, outgoing_rx, write_network_settings).await;
+                        NP::send_loop(write_half, outgoing_rx, send_network_error_sender,write_network_settings).await;
                     }, &runtime.0)),
                     send_message: outgoing_tx,
                     //addr: new_conn.addr,
@@ -272,6 +275,15 @@ pub(crate) fn handle_new_incoming_connections<NP: NetworkProvider, RT: Runtime>(
             .established_connections
             .remove(&disconnected_connection);
         network_events.send(NetworkEvent::Disconnected(disconnected_connection));
+    }
+}
+
+pub(crate) fn receive_and_send_network_errors<NP: NetworkProvider>(
+    net: ResMut<Network<NP>>,
+    mut error_writer: EventWriter<NetworkErrorEvent>,
+) {
+    while let Ok(error) = net.error_channel.receiver.try_recv() {
+        error_writer.send(NetworkErrorEvent(error));
     }
 }
 
