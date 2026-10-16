@@ -1,4 +1,3 @@
 # Rust build files
 /target
-.direnv
 */target
